@@ -1,6 +1,6 @@
 {
-  "version": "1.0.2",
-  "description": "Список изменений: добавлен обучающий гайд, автоматическое переключение на русский, оптимизация кода",
-  "downloadUrl": "https://github.com/Apreverra/lidovpn/releases/download/app-1.0.2/vpn-v.1.0.2.apk",
+  "version": "1.0.3",
+  "description": "Список изменений: поправлена ошибка с бесконечной версией 1.0, добавлены гео-логи",
+  "downloadUrl": "https://github.com/Apreverra/lidovpn/releases/download/1.0.3/vpn-1.0.3.apk",
   "forceUpdate": false
 }
