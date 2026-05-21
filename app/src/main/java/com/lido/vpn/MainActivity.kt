@@ -24,7 +24,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -442,7 +441,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
             isCheckingUpdate = true
             try {
                 val request = Request.Builder()
-                    .url("https://raw.githubusercontent.com/whoahaow/rjsxrd/main/update.json")
+                    .url("https://raw.githubusercontent.com/Apreverra/lidovpn/update.json")
                     .build()
                 withContext(Dispatchers.IO) {
                     client.newCall(request).execute().use { response ->
@@ -548,6 +547,56 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
             size >= 1024 -> String.format(Locale.getDefault(), "%.1f KB", size.toFloat() / 1024)
             else -> "$size B"
         }
+    }
+
+    fun simulateUpdate() {
+        val fakeInfo = VpnUpdateInfo(
+            version = "9.9.9-DEBUG",
+            description = "Это тестовое обновление для проверки интерфейса загрузки.\n- Добавлена магия\n- Исправлены баги в параллельной вселенной",
+            downloadUrl = "https://example.com/fake.apk"
+        )
+        updateInfo = fakeInfo
+    }
+
+    fun startFakeDownload() {
+        viewModelScope.launch {
+            isDownloadingUpdate = true
+            downloadProgress = 0f
+            downloadSpeed = "0 KB/s"
+            downloadedSizeInfo = "0 MB / 100 MB"
+            
+            val totalSize = 100 * 1024 * 1024L // 100MB
+            var currentRead = 0L
+            val startTime = System.currentTimeMillis()
+
+            while (currentRead < totalSize) {
+                if (!isDownloadingUpdate) break
+                kotlinx.coroutines.delay(100)
+                val chunk = (1..3).random() * 1024 * 1024L // 1-3MB per step
+                currentRead += chunk
+                if (currentRead > totalSize) currentRead = totalSize
+                
+                val elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000.0
+                val speed = if (elapsedSeconds > 0) currentRead / elapsedSeconds else 0.0
+                
+                downloadProgress = currentRead.toFloat() / totalSize
+                downloadSpeed = formatSpeed(speed)
+                downloadedSizeInfo = "${formatSize(currentRead)} / ${formatSize(totalSize)}"
+            }
+            
+            if (isDownloadingUpdate) {
+                showSnackbar(if (language == AppLanguage.RU) "Имитация загрузки завершена" else "Fake download finished")
+                isDownloadingUpdate = false
+                updateInfo = null
+            }
+        }
+    }
+
+    fun debugClearAll() {
+        prefs.edit { clear() }
+        servers = emptyList()
+        selectedServer = null
+        showSnackbar("Debug: All data cleared")
     }
 
     private fun installApk(context: Context, file: File) {
@@ -917,7 +966,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         }.joinToString("") { String(Character.toChars(it)) }
     }
 
-    private suspend fun tryGetGeoInfo(host: String): Pair<String, String>? {
+    private fun tryGetGeoInfo(host: String): Pair<String, String>? {
         val hostPart = if (host.isEmpty()) "" else "/$host"
         val endpoints = listOf(
             "https://ipwho.is$hostPart" to ("country_code" to "country"),
@@ -945,7 +994,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         return null
     }
 
-    private suspend fun fetchNameFromRestCountries(code: String): String? {
+    private fun fetchNameFromRestCountries(code: String): String? {
         return try {
             val request = Request.Builder()
                 .url("https://restcountries.com/v3.1/alpha/$code?fields=name")
@@ -993,7 +1042,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         checkJob = viewModelScope.launch {
             isChecking = true
             LogManager.addLog(if (language == AppLanguage.RU) "Запуск полной проверки серверов..." else "Starting full server health check...")
-            var workingCount = 0
+
 
             // Сбрасываем только те, что собираемся проверять
             servers = servers.map { it.copy(status = ServerStatus.UNKNOWN, ping = null, pingTelegram = null) }
@@ -1005,7 +1054,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                         semaphore.withPermit {
                             var pingResult: Long? = null
                             var success = false
-                            var countryInfo = ""
+
                             
                             try {
                                 if (!coroutineContext.isActive) return@withPermit
@@ -1078,7 +1127,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                 
                 applySort()
                 saveServers()
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 // Ignore cancellation
             } finally {
                 isChecking = false
@@ -1432,7 +1481,7 @@ fun ServersScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
 
                 Spacer(modifier = Modifier.width(4.dp))
 
-                val isAnyChecking = viewModel.isChecking || viewModel.isCheckingTelegram
+
 
                 Button(
                     onClick = { 
@@ -1567,12 +1616,21 @@ fun ServerItem(server: VpnServer, isSelected: Boolean, onClick: () -> Unit) {
                     if (server.status != ServerStatus.UNKNOWN) {
                         Column(horizontalAlignment = Alignment.End) {
                             server.pingTelegram?.let {
-                                Text(
-                                    text = "TG: $it ms",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color(0xFF24A1DE)
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.Send, // Иконка самолетика
+                                        contentDescription = null,
+                                        modifier = Modifier.size(10.dp),
+                                        tint = Color(0xFF24A1DE)
+                                    )
+                                    Spacer(Modifier.width(2.dp))
+                                    Text(
+                                        text = "$it ms",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF24A1DE)
+                                    )
+                                }
                             }
                             server.ping?.let {
                                 Text(
@@ -1642,7 +1700,7 @@ fun LogsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             }
         }
 
-        TabRow(
+        SecondaryTabRow(
             selectedTabIndex = selectedTab,
             containerColor = Color.Transparent,
             contentColor = MaterialTheme.colorScheme.primary,
@@ -1672,10 +1730,11 @@ fun LogsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                 ) {
                     items(filteredLogs) { log ->
                         val color = when {
+                            (log.contains("TG Check") || log.contains("Telegram")) && (log.contains("FAILED") || log.contains("Error")) -> Color(0xFF1565C0) // Темно-синий для ошибок ТГ
+                            log.contains("TG Check") || log.contains("Telegram") -> Color(0xFF24A1DE) // Успешный ТГ - голубой
                             log.contains("[Error]") || log.contains("FAILED") || log.contains("Error:") -> Color(0xFFF44336)
                             log.contains("[Warning]") -> Color(0xFFFF9800)
                             log.contains("ONLINE") -> Color(0xFF4CAF50)
-                            log.contains("TG Check") || log.contains("Telegram") -> Color(0xFF24A1DE)
                             log.contains("Запуск") || log.contains("Starting") || log.contains("[Info]") -> Color(0xFF8BC34A)
                             else -> MaterialTheme.colorScheme.onSurfaceVariant
                         }
@@ -1757,7 +1816,13 @@ fun UpdateDialog(viewModel: AppViewModel, info: VpnUpdateInfo, onDismiss: () -> 
         },
         confirmButton = {
             Button(
-                onClick = { viewModel.downloadAndInstallUpdate(context, info) },
+                onClick = { 
+                    if (info.version.contains("DEBUG")) {
+                        viewModel.startFakeDownload()
+                    } else {
+                        viewModel.downloadAndInstallUpdate(context, info)
+                    }
+                },
                 enabled = !viewModel.isDownloadingUpdate
             ) {
                 Text(if (viewModel.language == AppLanguage.RU) "Обновить" else "Update")
@@ -1783,6 +1848,8 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
     var showFingerprintMenu by remember { mutableStateOf(false) }
     var showAppSelection by remember { mutableStateOf(false) }
     var showConfigSelector by remember { mutableStateOf(false) }
+    var showDebugMenu by remember { mutableStateOf(false) }
+    var versionClickCount by remember { mutableIntStateOf(0) }
     
     // Временные состояния для полей ввода чисел
     var concurrentChecksText by remember { mutableStateOf(viewModel.concurrentChecks.toString()) }
@@ -2104,12 +2171,18 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             val currentVersion = remember(context) {
                 try {
                     context.packageManager.getPackageInfo(context.packageName, 0).versionName
-                } catch (e: Exception) { "1.0.0" }
+                } catch (_: Exception) { "1.0.0" }
             }
             Text(if (viewModel.language == AppLanguage.RU) "Обновление приложения" else "App Update", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             Spacer(modifier = Modifier.height(8.dp))
             Card(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().clickable { 
+                    versionClickCount++
+                    if (versionClickCount >= 5) {
+                        showDebugMenu = true
+                        versionClickCount = 0
+                    }
+                },
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
             ) {
                 Row(
@@ -2179,6 +2252,10 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
         }
     }
 
+    if (showDebugMenu) {
+        DebugMenuDialog(viewModel = viewModel, onDismiss = { showDebugMenu = false })
+    }
+
     if (showConfigSelector) {
         ConfigSelectionDialog(viewModel = viewModel, onDismiss = { showConfigSelector = false })
     }
@@ -2207,6 +2284,62 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                         Checkbox(checked = viewModel.selectedSources.contains(id), onCheckedChange = { _ -> viewModel.toggleSource(id) })
                         Text(text = "${if (viewModel.language == AppLanguage.RU) "Источник" else "Source"} $id", modifier = Modifier.padding(start = 8.dp))
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DebugMenuDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            shape = MaterialTheme.shapes.large
+        ) {
+            Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Debug / Admin Menu", style = MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.height(16.dp))
+                
+                Button(
+                    onClick = { 
+                        viewModel.simulateUpdate()
+                        onDismiss()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Simulate Fake Update")
+                }
+                
+                Spacer(Modifier.height(8.dp))
+                
+                Button(
+                    onClick = { 
+                        viewModel.debugClearAll()
+                        onDismiss()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Clear All Data (Prefs + Servers)")
+                }
+                
+                Spacer(Modifier.height(8.dp))
+                
+                Button(
+                    onClick = { 
+                        LogManager.addLog("[Debug] Manual test log entry")
+                        viewModel.showSnackbar("Logged test entry")
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Add Test Log Entry")
+                }
+
+                Spacer(Modifier.height(16.dp))
+                
+                TextButton(onClick = onDismiss) {
+                    Text("Close")
                 }
             }
         }
