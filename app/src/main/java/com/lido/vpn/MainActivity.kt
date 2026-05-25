@@ -16,7 +16,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -31,6 +31,10 @@ import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.*
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.material3.*
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffold
@@ -41,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -62,7 +67,9 @@ import com.google.gson.reflect.TypeToken
 import com.lido.vpn.ui.theme.VpnTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
- import kotlinx.coroutines.isActive
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
@@ -78,6 +85,7 @@ import java.util.Date
 import java.util.Locale
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.ConcurrentHashMap
 import libv2ray.Libv2ray
 
 class MainActivity : ComponentActivity() {
@@ -123,6 +131,10 @@ class MainActivity : ComponentActivity() {
 
             VpnTheme(darkTheme = vm.isDarkTheme) {
                 VpnApp(vm)
+                
+                if (!vm.hasSeenGuide || vm.showGuide) {
+                    OnboardingGuide(viewModel = vm)
+                }
             }
 
             LaunchedEffect(intent) {
@@ -143,8 +155,6 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun VpnApp(viewModel: AppViewModel = viewModel()) {
-    var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
-
     NavigationSuiteScaffold(
         navigationSuiteItems = {
             AppDestinations.entries.forEach {
@@ -162,8 +172,8 @@ fun VpnApp(viewModel: AppViewModel = viewModel()) {
                         )
                     },
                     label = { Text(label) },
-                    selected = it == currentDestination,
-                    onClick = { currentDestination = it }
+                    selected = it == viewModel.currentDestination,
+                    onClick = { viewModel.currentDestination = it }
                 )
             }
         }
@@ -173,7 +183,8 @@ fun VpnApp(viewModel: AppViewModel = viewModel()) {
             snackbarHost = { SnackbarHost(hostState = viewModel.snackbarHostState) }
         ) { innerPadding ->
             val contentModifier = Modifier.padding(innerPadding)
-            when (currentDestination) {
+            
+            when (viewModel.currentDestination) {
                 AppDestinations.HOME -> HomeScreen(viewModel, modifier = contentModifier)
                 AppDestinations.SERVERS -> ServersScreen(viewModel, modifier = contentModifier)
                 AppDestinations.LOGS -> LogsScreen(viewModel, modifier = contentModifier)
@@ -217,12 +228,226 @@ data class VpnUpdateInfo(
     val forceUpdate: Boolean = false
 )
 
+data class DpiPreset(
+    val name: String,
+    var score: Int = 0,
+    var lastResults: Map<String, Long?> = emptyMap()
+)
+
 class AppViewModel(application: android.app.Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("vpn_settings", Context.MODE_PRIVATE)
     private val gson = Gson()
 
+    
+    var isOptimizingDpi by mutableStateOf(false)
+    var optimizationProgress by mutableFloatStateOf(0f)
+    // var showDpiOptimization by mutableStateOf(false)
+
+    fun runDpiTest() {
+        viewModelScope.launch {
+            isOptimizingDpi = true
+            optimizationProgress = 0f
+            testResults = emptyMap()
+            
+            // Add -n google.com if not present
+            var finalCommand = dpiCommand
+            if (!finalCommand.contains("-n ") && !finalCommand.contains("--fake-sni")) {
+                finalCommand = "-n google.com " + finalCommand
+            }
+
+            LogManager.addLog(if (language == AppLanguage.RU) "Запуск проверки DPI настроек (ByeDPI): $finalCommand" else "Starting DPI settings check (ByeDPI): $finalCommand")
+
+            // На время теста останавливаем всё, что может мешать
+            if (isConnected) {
+                val intent = Intent(getApplication(), LidoVpnService::class.java).apply { action = "STOP" }
+                getApplication<android.app.Application>().startService(intent)
+                kotlinx.coroutines.delay(1000)
+            }
+
+            val testPort = 1080
+            // Запускаем ByeDPI на тестовом порту. 
+            ByeDPIController.start(getApplication(), finalCommand, testPort)
+            kotlinx.coroutines.delay(3000) // Даем больше времени на запуск
+
+            val proxy = java.net.Proxy(java.net.Proxy.Type.SOCKS, java.net.InetSocketAddress("127.0.0.1", testPort))
+            
+            // Custom DNS resolver to resolve via 8.8.8.8
+            val customDns = object : okhttp3.Dns {
+                override fun lookup(hostname: String): List<java.net.InetAddress> {
+                    return try {
+                        // Attempt to resolve using system resolver (which we'll hope follows our 8.8.8.8 preference)
+                        // In a more complex setup, we'd use a dedicated DNS client
+                        java.net.InetAddress.getAllByName(hostname).toList()
+                    } catch (e: Exception) {
+                        LogManager.addLog("DNS Error: Failed to resolve $hostname")
+                        throw e
+                    }
+                }
+            }
+
+            val testClient = OkHttpClient.Builder()
+                .proxy(proxy)
+                .dns(customDns)
+                .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+
+            var completed = 0
+            val total = dpiTestTargets.size
+            val semaphore = Semaphore(5) // Ограничиваем количество одновременных запросов
+            
+            val resultsList = withContext(Dispatchers.IO) {
+                dpiTestTargets.map { target ->
+                    async {
+                        semaphore.withPermit {
+                            val start = System.currentTimeMillis()
+                            var errorMsg: String? = null
+                            val success = try {
+                                val request = Request.Builder()
+                                    .url(target.second)
+                                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                    .build()
+                                testClient.newCall(request).execute().use { _ ->
+                                    true
+                                }
+                            } catch (e: Exception) {
+                                errorMsg = e.localizedMessage ?: e.message ?: "Connection Error"
+                                false
+                            }
+                            val delay = System.currentTimeMillis() - start
+                            
+                            val resultValue = if (success) "${delay}ms" else (errorMsg ?: "Timeout")
+                            
+                            withContext(Dispatchers.Main) {
+                                completed++
+                                optimizationProgress = completed.toFloat() / total
+                                LogManager.addLog("DPI Check: ${target.first} -> $resultValue")
+                            }
+                            target.first to resultValue
+                        }
+                    }
+                }.awaitAll()
+            }
+            
+            testResults = resultsList.toMap()
+            
+            // Останавливаем тестовый процесс
+            ByeDPIController.stop()
+            
+            // Если VPN был включен в режиме DPI, перезапускаем на основном порту
+            if (isConnected && isDpiOnlyMode) {
+                 ByeDPIController.start(getApplication(), dpiCommand, 1080)
+            }
+
+            isOptimizingDpi = false
+            val workingCount = testResults.values.count { it.contains("ms") }
+            LogManager.addLog(if (language == AppLanguage.RU) "Проверка DPI завершена. Доступно: $workingCount/$total" else "DPI check finished. Available: $workingCount/$total")
+            showSnackbar(if (language == AppLanguage.RU) "Проверка завершена" else "Test finished")
+        }
+    }
+
+    var dpiCommand by mutableStateOf(prefs.getString("dpi_command", "-o1 -d1 -a1 -At,r,s -s1 -d1 -s5+s -s10+s -s15+s -s20+s -r1+s -S -a1 -As -s1 -d1 -s5+s -s10+s -s15+s -s20+s -S -a1") ?: "-o1 -d1 -a1 -At,r,s -s1 -d1 -s5+s -s10+s -s15+s -s20+s -r1+s -S -a1 -As -s1 -d1 -s5+s -s10+s -s15+s -s20+s -S -a1")
+    var dpiEngine by mutableStateOf("ByeDPI")
+    
+    fun updateDpiEngine(value: String) {
+        // Force ByeDPI
+        dpiEngine = "ByeDPI"
+        prefs.edit { putString("dpi_engine", "ByeDPI") }
+        restartVpnIfConnected()
+    }
+    
+    fun updateDpiCommand(value: String) {
+        dpiCommand = value
+        prefs.edit { putString("dpi_command", value) }
+        
+        // Parse and update internal values
+        val (p, l, i) = parseDpiCommand(value)
+        dpiPackets = p
+        dpiLength = l
+        dpiInterval = i
+        
+        restartVpnIfConnected()
+    }
+
+    private fun parseDpiCommand(command: String): Triple<String, String, String> {
+        var packets = "all"
+        var minPos = 1
+        var maxPos = 2
+        var interval = "10-20"
+
+        val lowerCmd = command.lowercase()
+        
+        // 1. Протоколы (-K tls,http)
+        if (lowerCmd.contains("-k") || lowerCmd.contains("--proto")) {
+            if (lowerCmd.contains("tls")) packets = "tlshello"
+            else if (lowerCmd.contains("http")) packets = "httpget"
+        } else if (lowerCmd.contains("httpget")) {
+            packets = "httpget"
+        } else if (lowerCmd.contains("tlshello")) {
+            packets = "tlshello"
+        }
+
+        // 2. Ищем все позиции разреза (-s, -d, -o, -f, -q)
+        // Ищем паттерны типа -s1, -s 5, -d10, --split 20
+        val posRegex = Regex("(?:-s|-d|-o|-f|-q|--split|--disorder|--oob|--fake)\\s*(\\d+)")
+        val matches = posRegex.findAll(lowerCmd).toList()
+        
+        val positions = matches.map { it.groupValues[1].toInt() }.filter { it > 0 }.distinct().sorted()
+        
+        if (positions.isNotEmpty()) {
+            // Если у нас много позиций (как в примере пользователя), 
+            // мы закодируем их в строку "L" через запятую, а генератор разберет их на цепочку
+            if (positions.size > 1) {
+                val lengthStr = positions.joinToString(",")
+                
+                // Тайминг для сложных цепочек должен быть очень коротким
+                interval = "1-10"
+                if (lowerCmd.contains("-r") || lowerCmd.contains("--tlsrec")) interval = "1-3"
+                
+                return Triple(packets, lengthStr, interval)
+            }
+            
+            minPos = positions.minOrNull() ?: 1
+            maxPos = positions.maxOrNull() ?: (minPos + 2)
+            
+            // Если позиций много или они большие, расширяем диапазон
+            if (positions.size > 2 || maxPos > 50) {
+                maxPos = maxOf(maxPos, minPos + 5)
+            }
+        }
+
+        // 3. Учет флагов смещения (+s, +h) - это часто нужно для YouTube
+        if (lowerCmd.contains("+s") || lowerCmd.contains("+h")) {
+            if (maxPos < 20) maxPos = 40 // Расширяем для покрытия SNI/Host
+        }
+
+        // 4. Настройка интервала на основе сложности (Disorder/OOB/Fake)
+        if (lowerCmd.contains("-d") || lowerCmd.contains("-o") || lowerCmd.contains("-f")) {
+            interval = "5-15" 
+        }
+        if (lowerCmd.contains("-r") || lowerCmd.contains("--tlsrec")) {
+            interval = "1-5" 
+        }
+        
+        // Прямое указание диапазона (если пользователь ввел 100-200)
+        val rangeRegex = Regex("(\\d+)-(\\d+)")
+        rangeRegex.find(command)?.let {
+            return Triple(packets, it.value, interval)
+        }
+
+        val length = if (minPos == maxPos) "$minPos-${minPos + 2}" else "$minPos-$maxPos"
+        return Triple(packets, length, interval)
+    }
+
+    var currentDestination by mutableStateOf(AppDestinations.HOME)
+    var currentTutorialStep by mutableIntStateOf(0)
+
     var isDarkTheme by mutableStateOf(prefs.getBoolean("dark_theme", true))
-    var language by mutableStateOf(AppLanguage.valueOf(prefs.getString("language", "EN") ?: "EN"))
+    var language by mutableStateOf(
+        prefs.getString("language", null)?.let {
+            try { AppLanguage.valueOf(it) } catch (_: Exception) { null }
+        } ?: if (java.util.Locale.getDefault().language == "ru") AppLanguage.RU else AppLanguage.EN
+    )
     var selectedSources by mutableStateOf(
         prefs.getStringSet("selected_sources", emptySet()) ?: emptySet()
     )
@@ -249,20 +474,28 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
             addAll((1..16).map { ConfigSource("bypass-unsecure-$it", "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass-unsecure/bypass-unsecure-$it.txt") })
         }),
     )
-    var dnsServer by mutableStateOf(prefs.getString("dns_server", "1.1.1.1") ?: "1.1.1.1")
+    var dnsServer by mutableStateOf(prefs.getString("dns_server", "8.8.8.8") ?: "8.8.8.8")
     var routingMode by mutableStateOf(RoutingMode.valueOf(prefs.getString("routing_mode", "BYPASS_LAN_RU") ?: "BYPASS_LAN_RU"))
     var isSniffingEnabled by mutableStateOf(prefs.getBoolean("sniffing", true))
     var isMuxEnabled by mutableStateOf(prefs.getBoolean("mux", false))
-    var isFragmentEnabled by mutableStateOf(prefs.getBoolean("fragment", false))
+    var isFragmentEnabled by mutableStateOf(prefs.getBoolean("fragment", true))
     var mtu by mutableIntStateOf(prefs.getInt("mtu", 1500))
     var concurrentChecks by mutableIntStateOf(prefs.getInt("concurrent_checks", 15))
 
     var isKillSwitchEnabled by mutableStateOf(prefs.getBoolean("kill_switch", false))
     var isIpv6Enabled by mutableStateOf(prefs.getBoolean("ipv6_enabled", false))
     var utlsFingerprint by mutableStateOf(prefs.getString("utls_fingerprint", "chrome") ?: "chrome")
+    
+    var dpiPackets by mutableStateOf(prefs.getString("dpi_packets", "tlshello") ?: "tlshello")
+    var dpiLength by mutableStateOf(prefs.getString("dpi_length", "100-200") ?: "100-200")
+    var dpiInterval by mutableStateOf(prefs.getString("dpi_interval", "10-20") ?: "10-20")
+
+    var hasSeenGuide by mutableStateOf(prefs.getBoolean("has_seen_guide", false))
+    var showGuide by mutableStateOf(false)
 
     var isAppFilterEnabled by mutableStateOf(prefs.getBoolean("app_filter_enabled", false))
     var isBypassMode by mutableStateOf(prefs.getBoolean("app_filter_bypass", false))
+    var isDpiOnlyMode by mutableStateOf(prefs.getBoolean("dpi_only_mode", false))
     var selectedApps by mutableStateOf(prefs.getStringSet("selected_apps", emptySet()) ?: emptySet())
     var installedApps by mutableStateOf<List<AppInfo>>(emptyList())
     var isAppsLoading by mutableStateOf(false)
@@ -303,6 +536,71 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         restartVpnIfConnected()
     }
 
+    fun updateDpiOnlyMode(value: Boolean) {
+        isDpiOnlyMode = value
+        prefs.edit { putBoolean("dpi_only_mode", value) }
+        restartVpnIfConnected()
+    }
+
+    fun updateDpiPackets(value: String) {
+        dpiPackets = value
+        prefs.edit { putString("dpi_packets", value) }
+        restartVpnIfConnected()
+    }
+    
+    fun updateDpiLength(value: String) {
+        dpiLength = value
+        prefs.edit { putString("dpi_length", value) }
+        restartVpnIfConnected()
+    }
+    
+    fun updateDpiInterval(value: String) {
+        dpiInterval = value
+        prefs.edit { putString("dpi_interval", value) }
+        restartVpnIfConnected()
+    }
+
+    val dpiTestTargets = listOf(
+        "youtube.com" to "https://youtube.com",
+        "youtu.be" to "https://youtu.be",
+        "rr1---sn-4axm-n8vs.googlevideo.com" to "https://rr1---sn-4axm-n8vs.googlevideo.com",
+        "rr1---sn-gvnuxaxjvh-o8ge.googlevideo.com" to "https://rr1---sn-gvnuxaxjvh-o8ge.googlevideo.com",
+        "rr1---sn-ug5onuxaxjvh-p3ul.googlevideo.com" to "https://rr1---sn-ug5onuxaxjvh-p3ul.googlevideo.com",
+        "rr1---sn-ug5onuxaxjvh-n8v6.googlevideo.com" to "https://rr1---sn-ug5onuxaxjvh-n8v6.googlevideo.com",
+        "rr4---sn-q4flrnsl.googlevideo.com" to "https://rr4---sn-q4flrnsl.googlevideo.com",
+        "rr10---sn-gvnuxaxjvh-304z.googlevideo.com" to "https://rr10---sn-gvnuxaxjvh-304z.googlevideo.com",
+        "rr14---sn-n8v7kn7r.googlevideo.com" to "https://rr14---sn-n8v7kn7r.googlevideo.com",
+        "rr16---sn-axq7sn76.googlevideo.com" to "https://rr16---sn-axq7sn76.googlevideo.com",
+        "rr1---sn-8ph2xajvh-5xge.googlevideo.com" to "https://rr1---sn-8ph2xajvh-5xge.googlevideo.com",
+        "rr1---sn-gvnuxaxjvh-5gie.googlevideo.com" to "https://rr1---sn-gvnuxaxjvh-5gie.googlevideo.com",
+        "rr12---sn-gvnuxaxjvh-bvwz.googlevideo.com" to "https://rr12---sn-gvnuxaxjvh-bvwz.googlevideo.com",
+        "rr5---sn-n8v7knez.googlevideo.com" to "https://rr5---sn-n8v7knez.googlevideo.com",
+        "rr1---sn-u5uuxaxjvhg0-ocje.googlevideo.com" to "https://rr1---sn-u5uuxaxjvhg0-ocje.googlevideo.com",
+        "rr2---sn-q4fl6ndl.googlevideo.com" to "https://rr2---sn-q4fl6ndl.googlevideo.com",
+        "rr5---sn-gvnuxaxjvh-n8vk.googlevideo.com" to "https://rr5---sn-gvnuxaxjvh-n8vk.googlevideo.com",
+        "rr4---sn-jvhnu5g-c35d.googlevideo.com" to "https://rr4---sn-jvhnu5g-c35d.googlevideo.com",
+        "rr1---sn-q4fl6n6y.googlevideo.com" to "https://rr1---sn-q4fl6n6y.googlevideo.com",
+        "rr2---sn-hgn7ynek.googlevideo.com" to "https://rr2---sn-hgn7ynek.googlevideo.com",
+        "rr1---sn-xguxaxjvh-gufl.googlevideo.com" to "https://rr1---sn-xguxaxjvh-gufl.googlevideo.com",
+        "i.ytimg.com" to "https://i.ytimg.com",
+        "i9.ytimg.com" to "https://i9.ytimg.com",
+        "yt3.ggpht.com" to "https://yt3.ggpht.com",
+        "yt4.ggpht.com" to "https://yt4.ggpht.com",
+        "googleapis.com" to "https://googleapis.com",
+        "jnn-pa.googleapis.com" to "https://jnn-pa.googleapis.com",
+        "googleusercontent.com" to "https://googleusercontent.com",
+        "signaler-pa.youtube.com" to "https://signaler-pa.youtube.com",
+        "youtubei.googleapis.com" to "https://youtubei.googleapis.com",
+        "manifest.googlevideo.com" to "https://manifest.googlevideo.com",
+        "yt3.googleusercontent.com" to "https://yt3.googleusercontent.com",
+        "cloudflare.net" to "https://cloudflare.net",
+        "cloudflare.com" to "https://cloudflare.com",
+        "cloudflarecn.net" to "https://cloudflarecn.net",
+        "cloudflare-ech.com" to "https://cloudflare-ech.com"
+    )
+    var testResults by mutableStateOf<Map<String, String>>(emptyMap())
+    // var isTestingDpi by mutableStateOf(false)
+
     fun toggleAppSelection(packageName: String) {
         val newSelected = if (selectedApps.contains(packageName)) {
             selectedApps - packageName
@@ -331,7 +629,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
             _servers.addAll(value)
         }
 
-    private val countryCache = mutableMapOf<String, String>()
+    private val countryCache = ConcurrentHashMap<String, String>()
     private val geoSemaphore = Semaphore(10) // Ограничиваем только запросы к GeoIP API
 
     var isFetching by mutableStateOf(false)
@@ -354,6 +652,12 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                 duration = SnackbarDuration.Short
             )
         }
+    }
+
+    fun completeGuide() {
+        setGuideSeen()
+        showGuide = false
+        currentTutorialStep = 0
     }
 
     private fun cancelCheck() {
@@ -441,7 +745,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
             isCheckingUpdate = true
             try {
                 val request = Request.Builder()
-                    .url("https://raw.githubusercontent.com/Apreverra/lidovpn/update.json")
+                    .url("https://raw.githubusercontent.com/Apreverra/lidovpn/refs/heads/main/update.json")
                     .build()
                 withContext(Dispatchers.IO) {
                     client.newCall(request).execute().use { response ->
@@ -449,8 +753,9 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                             val body = response.body?.string()
                             val latest = gson.fromJson(body, VpnUpdateInfo::class.java)
                             val current = getApplication<android.app.Application>().packageManager
-                                .getPackageInfo(getApplication<android.app.Application>().packageName, 0).versionName
-                            if (latest.version != current) {
+                                .getPackageInfo(getApplication<android.app.Application>().packageName, 0).versionName ?: "1.0.0"
+                            
+                            if (isNewerVersion(current, latest.version)) {
                                 withContext(Dispatchers.Main) {
                                     updateInfo = latest
                                 }
@@ -464,6 +769,28 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                 isCheckingUpdate = false
             }
         }
+    }
+
+    private fun isNewerVersion(current: String, latest: String): Boolean {
+        try {
+            // Убираем лишние символы (например, 'v' в начале) и разбиваем по точкам
+            val currParts = current.replace(Regex("[^0-9.]"), "").split(".").map { it.toInt() }
+            val lateParts = latest.replace(Regex("[^0-9.]"), "").split(".").map { it.toInt() }
+            
+            val maxLength = maxOf(currParts.size, lateParts.size)
+            
+            for (i in 0 until maxLength) {
+                val currV = currParts.getOrElse(i) { 0 }
+                val lateV = lateParts.getOrElse(i) { 0 }
+                
+                if (lateV > currV) return true
+                if (lateV < currV) return false
+            }
+        } catch (_: Exception) {
+            // Если формат странный (например, DEBUG версия), возвращаем простое сравнение строк
+            return latest != current
+        }
+        return false
     }
 
     fun downloadAndInstallUpdate(context: Context, info: VpnUpdateInfo) {
@@ -626,8 +953,9 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
     }
 
     private fun saveServers() {
+        val serversToSave = _servers.toList()
         viewModelScope.launch(Dispatchers.IO) {
-            val json = gson.toJson(servers)
+            val json = gson.toJson(serversToSave)
             prefs.edit { putString("saved_servers", json) }
         }
     }
@@ -709,6 +1037,11 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         restartVpnIfConnected()
     }
 
+    fun setGuideSeen() {
+        hasSeenGuide = true
+        prefs.edit { putBoolean("has_seen_guide", true) }
+    }
+
     fun updatePingMethod(value: PingMethod) {
         pingMethod = value
         prefs.edit { putString("ping_method", value.name) }
@@ -739,6 +1072,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         }
     }
 
+
     enum class RoutingMode(val label: String) {
         GLOBAL("Global"),
         BYPASS_LAN_RU("Bypass LAN & Russia"),
@@ -756,13 +1090,35 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         HTTP("HTTP Request (Site)")
     }
 
+
     fun toggleVpn(context: Context) {
-        val server = selectedServer ?: return
         if (isConnected) {
             disconnect()
-        } else {
-            connect(server, context)
+            return
         }
+
+        if (isDpiOnlyMode) {
+            val dpiServer = VpnServer(
+                name = "Direct DPI Bypass",
+                type = "DPI_ONLY",
+                host = "127.0.0.1",
+                port = 0,
+                uuid = ""
+            )
+            connect(dpiServer, context)
+            return
+        }
+
+        val server = selectedServer ?: pickBestServer()
+        if (server != null) {
+            connect(server, context)
+        } else {
+            showSnackbar(if (language == AppLanguage.RU) "Пожалуйста, сначала выберите сервер" else "Please select a server first")
+        }
+    }
+
+    private fun pickBestServer(): VpnServer? {
+        return servers.firstOrNull { it.status == ServerStatus.WORKING }
     }
 
     private fun connect(server: VpnServer, context: Context) {
@@ -806,6 +1162,10 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
             putExtra("KILL_SWITCH", isKillSwitchEnabled)
             putExtra("IPV6_ENABLED", isIpv6Enabled)
             putExtra("UTLS_FINGERPRINT", utlsFingerprint)
+            putExtra("DPI_PACKETS", dpiPackets)
+            putExtra("DPI_LENGTH", dpiLength)
+            putExtra("DPI_INTERVAL", dpiInterval)
+            putExtra("DPI_ENGINE", dpiEngine)
             
             putExtra("APP_FILTER_ENABLED", isAppFilterEnabled)
             putExtra("APP_FILTER_BYPASS", isBypassMode)
@@ -978,15 +1338,13 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         for ((url, keys) in endpoints) {
             try {
                 val request = Request.Builder().url(url).build()
-                client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful) {
-                        val body = response.body?.string() ?: ""
-                        val json = org.json.JSONObject(body)
-                        val code = json.optString(keys.first)
-                        val name = if (keys.second.isNotEmpty()) json.optString(keys.second) else ""
-                        if (code.isNotEmpty()) return Pair(code, name)
-                    }
-                }
+                val body = client.newCall(request).execute().use { it.body?.string() ?: "" }
+
+                if (body.isEmpty()) continue
+                val json = org.json.JSONObject(body)
+                val code = json.optString(keys.first)
+                val name = if (keys.second.isNotEmpty()) json.optString(keys.second) else ""
+                if (code.isNotEmpty()) return Pair(code, name)
             } catch (e: Exception) {
                 android.util.Log.w("GeoIP", "Provider failed: $url - ${e.message}")
             }
@@ -996,23 +1354,19 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
 
     private fun fetchNameFromRestCountries(code: String): String? {
         return try {
-            val request = Request.Builder()
-                .url("https://restcountries.com/v3.1/alpha/$code?fields=name")
-                .build()
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body?.string() ?: ""
-                    val json = org.json.JSONObject(body)
-                    json.getJSONObject("name").optString("common")
-                } else null
-            }
+            val url = "https://restcountries.com/v3.1/alpha/$code?fields=name"
+            val request = Request.Builder().url(url).build()
+            val body = client.newCall(request).execute().use { it.body?.string() ?: "" }
+            if (body.isEmpty()) return null
+            val json = org.json.JSONObject(body)
+            json.getJSONObject("name").optString("common")
         } catch (_: Exception) {
             null
         }
     }
 
-    private fun updateServerInList(rawUrl: String, transform: (VpnServer) -> VpnServer) {
-        val index = _servers.indexOfFirst { it.rawUrl == rawUrl }
+    private fun updateServerInList(server: VpnServer, transform: (VpnServer) -> VpnServer) {
+        val index = _servers.indexOfFirst { it.host == server.host && it.port == server.port && it.name == server.name }
         if (index != -1) {
             _servers[index] = transform(_servers[index])
         }
@@ -1039,12 +1393,11 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
     fun checkAllServers() {
         if (servers.isEmpty()) return
         cancelCheck()
+        isChecking = true
         checkJob = viewModelScope.launch {
-            isChecking = true
             LogManager.addLog(if (language == AppLanguage.RU) "Запуск полной проверки серверов..." else "Starting full server health check...")
-
-
-            // Сбрасываем только те, что собираемся проверять
+            
+            // Сбрасываем статусы
             servers = servers.map { it.copy(status = ServerStatus.UNKNOWN, ping = null, pingTelegram = null) }
 
             val semaphore = Semaphore(concurrentChecks)
@@ -1054,10 +1407,9 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                         semaphore.withPermit {
                             var pingResult: Long? = null
                             var success = false
-
                             
                             try {
-                                if (!coroutineContext.isActive) return@withPermit
+                                if (!this@launch.isActive) return@withPermit
                                 
                                 if (pingMethod == PingMethod.TCP) {
                                     pingResult = fastTcpPing(server.host, server.port)
@@ -1072,54 +1424,54 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                                         routingMode = "ONLY_PROXY",
                                         mtu = mtu,
                                         assetPath = getApplication<android.app.Application>().filesDir.absolutePath,
-                                        utlsFingerprint = utlsFingerprint
+                                        utlsFingerprint = utlsFingerprint,
+                                        dpiPackets = dpiPackets,
+                                        dpiLength = dpiLength,
+                                        dpiInterval = dpiInterval,
+                                        socksProxyPort = if (isDpiOnlyMode) 1080 else 0
                                     )
                                     val delay = Libv2ray.measureOutboundDelay(vpnConfig, pingTargetUrl)
                                     
                                     if (delay > 0) {
-                                        pingResult = delay // Используем чистый сетевой пинг от ядра Xray
+                                        pingResult = delay
                                         success = true
                                     }
                                 }
 
                                 if (success) {
-                                    if (coroutineContext.isActive) {
+                                    if (this@launch.isActive) {
                                         LogManager.addLog("Check: ${server.name} -> ONLINE (${pingResult} ms)")
                                     }
                                     
-                                    // Обновляем статус в UI немедленно
                                     withContext(Dispatchers.Main) {
-                                        updateServerInList(server.rawUrl) {
+                                        updateServerInList(server) {
                                             it.copy(status = ServerStatus.WORKING, ping = pingResult)
                                         }
                                     }
 
-                                    // Запускаем поиск страны ПАРАЛЛЕЛЬНО, не занимая слот пинга
                                     launch {
                                         val country = fetchCountryWithCache(server)
                                         if (country.isNotEmpty()) {
                                             withContext(Dispatchers.Main) {
-                                                updateServerInList(server.rawUrl) { it.copy(country = country) }
+                                                updateServerInList(server) { it.copy(country = country) }
                                             }
                                         }
                                     }
                                 } else {
-                                    if (coroutineContext.isActive) {
+                                    if (this@launch.isActive) {
                                         LogManager.addLog("Check: ${server.name} -> FAILED OR SLOW")
                                     }
                                     withContext(Dispatchers.Main) {
-                                        updateServerInList(server.rawUrl) { it.copy(status = ServerStatus.NOT_WORKING) }
+                                        updateServerInList(server) { it.copy(status = ServerStatus.NOT_WORKING) }
                                     }
                                 }
                             } catch (e: Exception) {
-                                if (coroutineContext.isActive && e !is kotlinx.coroutines.CancellationException) {
+                                if (this@launch.isActive && e !is kotlinx.coroutines.CancellationException) {
                                     LogManager.addLog("Check Error: ${server.name} -> ${e.message}")
                                 }
                                 withContext(Dispatchers.Main) {
-                                    updateServerInList(server.rawUrl) { it.copy(status = ServerStatus.NOT_WORKING) }
+                                    updateServerInList(server) { it.copy(status = ServerStatus.NOT_WORKING) }
                                 }
-                            } finally {
-                                // Семафор освободится здесь
                             }
                         }
                     }
@@ -1127,16 +1479,18 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                 
                 applySort()
                 saveServers()
-            } catch (_: Exception) {
-                // Ignore cancellation
+            } catch (e: Exception) {
+                // Ignore
             } finally {
                 isChecking = false
-                applySort()
-                val finalWorkingCount = servers.count { it.status == ServerStatus.WORKING }
-                showSnackbar(
-                    if (language == AppLanguage.RU) "Проверка окончена. Рабочих: $finalWorkingCount"
-                    else "Check finished. Working: $finalWorkingCount"
-                )
+                withContext(Dispatchers.Main) {
+                    applySort()
+                    val finalWorkingCount = servers.count { it.status == ServerStatus.WORKING }
+                    showSnackbar(
+                        if (language == AppLanguage.RU) "Проверка окончена. Рабочих: $finalWorkingCount"
+                        else "Check finished. Working: $finalWorkingCount"
+                    )
+                }
             }
         }
     }
@@ -1151,6 +1505,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         if (workingServers.isEmpty()) return
         
         cancelCheck()
+        isCheckingTelegram = true
         
         // 1. Сбрасываем пинг ТГ перед началом только для рабочих серверов
         servers = servers.map { 
@@ -1159,7 +1514,6 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
 
         val semaphore = Semaphore(concurrentChecks)
         checkJob = viewModelScope.launch {
-            isCheckingTelegram = true
             LogManager.addLog("Запуск проверки Telegram для ${workingServers.size} серверов...")
             try {
                 workingServers.map { server ->
@@ -1167,7 +1521,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                         semaphore.withPermit {
                             var pingResult: Long? = null
                             try {
-                                if (!coroutineContext.isActive) return@withPermit
+                                if (!this@launch.isActive) return@withPermit
                                 val vpnConfig = XrayConfigGenerator.generateConfig(
                                     server = server,
                                     dns = dnsServer,
@@ -1176,7 +1530,12 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                                     fragment = isFragmentEnabled,
                                     routingMode = "ONLY_PROXY",
                                     mtu = mtu,
-                                    assetPath = getApplication<android.app.Application>().filesDir.absolutePath
+                                    assetPath = getApplication<android.app.Application>().filesDir.absolutePath,
+                                    utlsFingerprint = utlsFingerprint,
+                                    dpiPackets = dpiPackets,
+                                    dpiLength = dpiLength,
+                                    dpiInterval = dpiInterval,
+                                    socksProxyPort = if (isDpiOnlyMode) 1080 else 0
                                 )
                                 val startTime = System.currentTimeMillis()
                                 val delay = Libv2ray.measureOutboundDelay(vpnConfig, "https://t.me/telegram")
@@ -1185,28 +1544,25 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
 
                                 if (delay > 0 && totalDuration < 10000) {
                                     pingResult = totalDuration
-                                    if (coroutineContext.isActive) {
+                                    if (this@launch.isActive) {
                                         LogManager.addLog("TG Check: ${server.name} -> ONLINE ($totalDuration ms)")
                                     }
                                 } else {
-                                    if (coroutineContext.isActive) {
+                                    if (this@launch.isActive) {
                                         LogManager.addLog("TG Check: ${server.name} -> FAILED")
                                     }
                                 }
                             } catch (e: Exception) {
-                                if (coroutineContext.isActive && e !is kotlinx.coroutines.CancellationException) {
+                                if (this@launch.isActive && e !is kotlinx.coroutines.CancellationException) {
                                     LogManager.addLog("TG Check Error: ${server.name} -> ${e.message}")
                                 }
                             } finally {
-                                if (coroutineContext.isActive) {
-                                    withContext(Dispatchers.Main) {
-                                        val currentIndex = servers.indexOfFirst { it.host == server.host && it.port == server.port && it.name == server.name }
-                                        if (currentIndex != -1) {
-                                            val newList = servers.toMutableList()
-                                            newList[currentIndex] = newList[currentIndex].copy(pingTelegram = pingResult)
-                                            // 2. Не сортируем во время проверки, чтобы список не "прыгал"
-                                            servers = newList 
-                                        }
+                                withContext(Dispatchers.Main) {
+                                    val currentIndex = servers.indexOfFirst { it.host == server.host && it.port == server.port && it.name == server.name }
+                                    if (currentIndex != -1) {
+                                        val newList = servers.toMutableList()
+                                        newList[currentIndex] = newList[currentIndex].copy(pingTelegram = pingResult)
+                                        servers = newList 
                                     }
                                 }
                             }
@@ -1214,9 +1570,10 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                     }
                 }.joinAll()
                 
-                // 3. Сортируем один раз в самом конце
                 servers = getSortedList(servers)
                 saveServers()
+            } catch (e: Exception) {
+                // Ignore
             } finally {
                 isCheckingTelegram = false
             }
@@ -1347,6 +1704,7 @@ fun HomeScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                     .clip(CircleShape)
                     .background(buttonColor.copy(alpha = 0.1f))
                     .border(4.dp, buttonColor, CircleShape)
+                    .tutorialHighlight(viewModel.currentTutorialStep == 8)
                     .clickable { viewModel.toggleVpn(context) },
                 contentAlignment = Alignment.Center
             ) {
@@ -1360,49 +1718,81 @@ fun HomeScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
         }
         
         Box(modifier = Modifier.align(Alignment.BottomCenter)) {
-            viewModel.selectedServer?.let { server ->
+            if (viewModel.isDpiOnlyMode) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f))
                 ) {
                     Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(if (viewModel.language == AppLanguage.RU) "Выбранный сервер" else "Selected Server", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
-                            Text(server.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold, maxLines = 1)
-                            Text("${server.host}:${server.port}", style = MaterialTheme.typography.bodySmall)
+                        Icon(Icons.Default.Security, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                text = if (viewModel.language == AppLanguage.RU) "Режим: DPI Bypass" else "Mode: DPI Bypass",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = if (viewModel.language == AppLanguage.RU) "Прямое подключение без прокси" else "Direct connection without proxy",
+                                style = MaterialTheme.typography.bodySmall
+                            )
                         }
-                        
-                        if (server.status != ServerStatus.UNKNOWN) {
-                            Column(horizontalAlignment = Alignment.End, modifier = Modifier.padding(horizontal = 8.dp)) {
-                                server.pingTelegram?.let {
-                                    Text(
-                                        text = "TG: $it ms",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color(0xFF24A1DE)
-                                    )
-                                }
-                                server.ping?.let {
-                                    Text(
-                                        text = "Ping: $it ms",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (it < 150) Color(0xFF4CAF50) else if (it < 300) Color(0xFFFFC107) else Color(0xFFF44336)
-                                    )
-                                }
-                                if (server.country.isNotEmpty()) {
-                                    Text(text = server.country, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            } else {
+                viewModel.selectedServer?.let { server ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    ) {
+                        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(if (viewModel.language == AppLanguage.RU) "Выбранный сервер" else "Selected Server", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                Text(server.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold, maxLines = 1)
+                                Text("${server.host}:${server.port}", style = MaterialTheme.typography.bodySmall)
+                            }
+                            
+                            if (server.status != ServerStatus.UNKNOWN) {
+                                Column(horizontalAlignment = Alignment.End, modifier = Modifier.padding(horizontal = 8.dp)) {
+                                    server.pingTelegram?.let {
+                                        Text(
+                                            text = "TG: $it ms",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF24A1DE)
+                                        )
+                                    }
+                                    server.ping?.let {
+                                        Text(
+                                            text = "Ping: $it ms",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (it < 150) Color(0xFF4CAF50) else if (it < 300) Color(0xFFFFC107) else Color(0xFFF44336)
+                                        )
+                                    }
+                                    if (server.country.isNotEmpty()) {
+                                        Text(text = server.country, style = MaterialTheme.typography.bodySmall)
+                                    }
                                 }
                             }
                         }
                     }
+                } ?: Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.2f))
+                ) {
+                    Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            text = if (viewModel.language == AppLanguage.RU) "Сервер не выбран" else "No server selected",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
                 }
-            } ?: Text(
-                text = if (viewModel.language == AppLanguage.RU) "Пожалуйста, сначала выберите сервер" else "Please select a server first",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(bottom = 16.dp)
-            )
+            }
         }
     }
 }
@@ -1428,7 +1818,10 @@ fun ServersScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box {
-                    IconButton(onClick = { showSortMenu = true }) {
+                    IconButton(
+                        onClick = { showSortMenu = true },
+                        modifier = Modifier.tutorialHighlight(viewModel.currentTutorialStep == 7)
+                    ) {
                         Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = "Sort")
                     }
                     DropdownMenu(expanded = showSortMenu, onDismissRequest = { showSortMenu = false }) {
@@ -1452,7 +1845,8 @@ fun ServersScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
 
                 IconButton(
                     onClick = { viewModel.fetchServers() },
-                    enabled = !viewModel.isFetching && viewModel.selectedSources.isNotEmpty()
+                    enabled = !viewModel.isFetching && viewModel.selectedSources.isNotEmpty(),
+                    modifier = Modifier.tutorialHighlight(viewModel.currentTutorialStep == 4)
                 ) {
                     if (viewModel.isFetching) {
                         CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
@@ -1466,7 +1860,8 @@ fun ServersScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                         if (viewModel.isCheckingTelegram) viewModel.stopCheck() 
                         else viewModel.checkAllTelegram() 
                     },
-                    enabled = (viewModel.isCheckingTelegram || workingServers.isNotEmpty())
+                    enabled = (viewModel.isCheckingTelegram || workingServers.isNotEmpty()),
+                    modifier = Modifier.tutorialHighlight(viewModel.currentTutorialStep == 6)
                 ) {
                     if (viewModel.isCheckingTelegram) {
                         Icon(Icons.Default.Stop, contentDescription = "Stop Telegram Check", tint = Color.Red)
@@ -1490,7 +1885,8 @@ fun ServersScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                     },
                     enabled = viewModel.isChecking || viewModel.servers.isNotEmpty(),
                     colors = if (viewModel.isChecking) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.errorContainer, contentColor = MaterialTheme.colorScheme.onErrorContainer) else ButtonDefaults.buttonColors(),
-                    contentPadding = PaddingValues(horizontal = 12.dp)
+                    contentPadding = PaddingValues(horizontal = 12.dp),
+                    modifier = Modifier.tutorialHighlight(viewModel.currentTutorialStep == 5)
                 ) {
                     if (viewModel.isChecking) {
                         Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -1596,10 +1992,12 @@ fun CategoryHeader(title: String, count: Int, color: Color, isExpanded: Boolean,
 
 @Composable
 fun ServerItem(server: VpnServer, isSelected: Boolean, onClick: () -> Unit) {
+    val viewModel: AppViewModel = viewModel()
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() },
+            .clickable { onClick() }
+            .tutorialHighlight(viewModel.currentTutorialStep == 7 && server.status == ServerStatus.WORKING),
         colors = CardDefaults.cardColors(
             containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
         ),
@@ -1663,28 +2061,41 @@ fun ServerItem(server: VpnServer, isSelected: Boolean, onClick: () -> Unit) {
 
 @Composable
 fun LogsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
-    val lazyListState = rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) {
-        androidx.compose.foundation.lazy.LazyListState()
-    }
     val logs = LogManager.vpnLogs
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
 
+    // Independent scroll states for each tab
+    val allScrollState = rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+    val checkScrollState = rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+    val geoScrollState = rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+    val coreScrollState = rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+
+    val currentScrollState = when(selectedTab) {
+        1 -> checkScrollState
+        2 -> geoScrollState
+        3 -> coreScrollState
+        else -> allScrollState
+    }
+
     val filteredLogs = remember(logs, selectedTab) {
         when (selectedTab) {
-            // Tab 1: Server Health & GeoIP Checks
-            1 -> logs.filter { it.contains("Check") || it.contains("Geo:") }
-            // Tab 2: Connection logs & Xray Engine logs
-            2 -> logs.filter { !it.contains("Check") && !it.contains("Geo:") && it.contains(":") }
+            // Tab 1: Server Health Checks (Ping, Telegram)
+            1 -> logs.filter { it.contains("Check") && !it.contains("Geo:") }
+            // Tab 2: GeoIP & Geo-data logs
+            2 -> logs.filter { it.contains("Geo:") || it.contains("geo-данные") || it.contains("Geo Data") }
+            // Tab 3: Connection logs & Xray Engine logs
+            3 -> logs.filter { !it.contains("Check") && !it.contains("Geo:") && (it.contains(":") || it.contains("[")) }
             else -> logs
         }
     }
 
-    // Auto-scroll logic: scroll to bottom only if we were already near the bottom
+    // Auto-scroll logic for current tab
     LaunchedEffect(filteredLogs.size) {
-        val lastVisibleItem = lazyListState.layoutInfo.visibleItemsInfo.lastOrNull()
+        val layoutInfo = currentScrollState.layoutInfo
+        val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()
         if (lastVisibleItem != null && lastVisibleItem.index >= filteredLogs.size - 5) {
-            lazyListState.animateScrollToItem(filteredLogs.size - 1)
+            currentScrollState.animateScrollToItem(filteredLogs.size - 1)
         }
     }
 
@@ -1707,7 +2118,7 @@ fun LogsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             divider = {}
         ) {
             val tabs = if (viewModel.language == AppLanguage.RU) 
-                listOf("Все", "Проверка", "Ядро") else listOf("All", "Checks", "Core")
+                listOf("Все", "Пинг", "Гео", "Ядро") else listOf("All", "Ping", "Geo", "Core")
             tabs.forEachIndexed { index, title ->
                 Tab(
                     selected = selectedTab == index,
@@ -1725,13 +2136,14 @@ fun LogsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
             ) {
                 LazyColumn(
-                    state = lazyListState,
+                    state = currentScrollState,
                     modifier = Modifier.padding(8.dp).fillMaxSize()
                 ) {
                     items(filteredLogs) { log ->
                         val color = when {
-                            (log.contains("TG Check") || log.contains("Telegram")) && (log.contains("FAILED") || log.contains("Error")) -> Color(0xFF1565C0) // Темно-синий для ошибок ТГ
-                            log.contains("TG Check") || log.contains("Telegram") -> Color(0xFF24A1DE) // Успешный ТГ - голубой
+                            log.contains("Geo:") -> Color(0xFFCE93D8) // Light Purple for Geo
+                            (log.startsWith("TG Check") || log.startsWith("Telegram Check")) && (log.contains("FAILED") || log.contains("Error")) -> Color(0xFF1565C0)
+                            log.startsWith("TG Check") || log.startsWith("Telegram Check") -> Color(0xFF24A1DE)
                             log.contains("[Error]") || log.contains("FAILED") || log.contains("Error:") -> Color(0xFFF44336)
                             log.contains("[Warning]") -> Color(0xFFFF9800)
                             log.contains("ONLINE") -> Color(0xFF4CAF50)
@@ -1749,9 +2161,9 @@ fun LogsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             }
 
             // Scroll to bottom button
-            val showButton by remember(filteredLogs.size) {
+            val showButton by remember(filteredLogs.size, selectedTab) {
                 derivedStateOf {
-                    val layoutInfo = lazyListState.layoutInfo
+                    val layoutInfo = currentScrollState.layoutInfo
                     val visibleItems = layoutInfo.visibleItemsInfo
                     if (visibleItems.isEmpty()) false
                     else {
@@ -1766,7 +2178,7 @@ fun LogsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                     onClick = {
                         scope.launch {
                             if (filteredLogs.isNotEmpty()) {
-                                lazyListState.animateScrollToItem(filteredLogs.size - 1)
+                                currentScrollState.animateScrollToItem(filteredLogs.size - 1)
                             }
                         }
                     },
@@ -1861,7 +2273,142 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             Spacer(modifier = Modifier.height(24.dp))
         }
 
-        // 1. App Filtering (NEW)
+        // 1. DPI Bypass (NEW)
+        item {
+            Text(if (viewModel.language == AppLanguage.RU) "Обход блокировок (DPI)" else "DPI Bypass", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            Spacer(modifier = Modifier.height(8.dp))
+            
+            SettingsSwitch(
+                label = if (viewModel.language == AppLanguage.RU) "Только DPI Bypass (Direct)" else "DPI Bypass Only (Direct)",
+                subtitle = if (viewModel.language == AppLanguage.RU) "Работает без прокси-сервера. Только обход цензуры." else "Works without a proxy server. Only censorship bypass.",
+                checked = viewModel.isDpiOnlyMode,
+                onCheckedChange = { viewModel.updateDpiOnlyMode(it) }
+            )
+
+            AnimatedVisibility(visible = viewModel.isDpiOnlyMode || viewModel.isFragmentEnabled) {
+                Column(modifier = Modifier.padding(top = 16.dp)) {
+                    Text(
+                        if (viewModel.language == AppLanguage.RU) "Командная строка DPI" else "DPI Command Line",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = viewModel.dpiCommand,
+                        onValueChange = { viewModel.updateDpiCommand(it) },
+                        label = { Text("Command Line (e.g. -o1 -d1 -s1)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("-o1 -d1 -s1 -a1") },
+                        singleLine = false,
+                        maxLines = 3
+                    )
+                    
+                    
+                    /* 
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = if (viewModel.language == AppLanguage.RU) "Движок DPI:" else "DPI Engine:",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Row {
+                            listOf("Xray", "ByeByeDPI").forEach { engine ->
+                                FilterChip(
+                                    selected = viewModel.dpiEngine == engine,
+                                    onClick = { viewModel.updateDpiEngine(engine) },
+                                    label = { Text(engine) },
+                                    modifier = Modifier.padding(start = 8.dp)
+                                )
+                            }
+                        }
+                    }
+                    */
+
+                    Spacer(Modifier.height(16.dp))
+                    
+                    Button(
+                        onClick = { viewModel.runDpiTest() },
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary),
+                        enabled = !viewModel.isOptimizingDpi
+                    ) {
+                        if (viewModel.isOptimizingDpi) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onTertiary)
+                        } else {
+                            Icon(Icons.Default.Speed, null)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(if (viewModel.language == AppLanguage.RU) "Проверить настройки" else "Test Settings")
+                    }
+
+                    if (viewModel.isOptimizingDpi) {
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            progress = { viewModel.optimizationProgress },
+                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape)
+                        )
+                    }
+
+                    if (viewModel.testResults.isNotEmpty()) {
+                        Spacer(Modifier.height(12.dp))
+                        
+                        Card(
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                        ) {
+                            Column(modifier = Modifier.padding(8.dp)) {
+                                val workingCount = viewModel.testResults.values.count { it.endsWith("ms") }
+                                val totalCount = viewModel.dpiTestTargets.size
+                                
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = if (viewModel.language == AppLanguage.RU) "Результаты проверки:" else "Test Results:",
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    Text(
+                                        text = "$workingCount / $totalCount",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (workingCount == totalCount) Color(0xFF4CAF50) else if (workingCount > 0) Color(0xFFFFC107) else Color(0xFFF44336)
+                                    )
+                                }
+
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = MaterialTheme.colorScheme.outlineVariant)
+
+                                LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                                    items(viewModel.testResults.toList()) { (name, result) ->
+                                        val isWorking = result.matches(Regex("^[0-9]+ms$"))
+                                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+                                            Text(
+                                                text = name,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = if (isWorking) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error
+                                            )
+                                            Text(
+                                                text = result,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = if (isWorking) Color(0xFF4CAF50) else Color(0xFFF44336)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        // 2. App Filtering (NEW)
         item {
             Text(if (viewModel.language == AppLanguage.RU) "Фильтрация приложений" else "App Filtering", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             Spacer(modifier = Modifier.height(8.dp))
@@ -1911,7 +2458,9 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             
             Button(
                 onClick = { showConfigSelector = true },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .tutorialHighlight(viewModel.currentTutorialStep == 2)
             ) {
                 Icon(Icons.Default.LibraryAdd, null)
                 Spacer(Modifier.width(8.dp))
@@ -2110,6 +2659,7 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                 )
             Spacer(modifier = Modifier.height(16.dp))
             }
+
             Spacer(modifier = Modifier.height(8.dp))
         }
 
@@ -2127,20 +2677,25 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Column {
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(file.name, fontWeight = FontWeight.Bold)
-                                if (file.remoteVersion.isNotEmpty()) {
-                                    Text("GitHub: ${file.remoteVersion}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
-                                }
                             }
                             if (file.exists) {
                                 Column(horizontalAlignment = Alignment.End) {
                                     Text("${String.format(Locale.getDefault(), "%.2f", file.size / 1024.0 / 1024.0)} MB", style = MaterialTheme.typography.bodySmall)
                                     val date = SimpleDateFormat("dd.MM.yy", Locale.getDefault()).format(Date(file.lastModified))
-                                    Text(date, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                    Text("${if (viewModel.language == AppLanguage.RU) "Локально: " else "Local: "}$date", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                    if (file.remoteVersion.isNotEmpty()) {
+                                        Text("GitHub: ${file.remoteVersion}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
+                                    }
                                 }
                             } else {
-                                Text(if (viewModel.language == AppLanguage.RU) "Отсутствует" else "Missing", color = MaterialTheme.colorScheme.error)
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text(if (viewModel.language == AppLanguage.RU) "Отсутствует" else "Missing", color = MaterialTheme.colorScheme.error)
+                                    if (file.remoteVersion.isNotEmpty()) {
+                                        Text("GitHub: ${file.remoteVersion}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
+                                    }
+                                }
                             }
                         }
                     }
@@ -2249,6 +2804,16 @@ fun SettingsScreen(viewModel: AppViewModel, modifier: Modifier = Modifier) {
                 )
             }
             Spacer(modifier = Modifier.height(32.dp))
+
+            Button(
+                onClick = { viewModel.showGuide = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Help, null)
+                Spacer(Modifier.width(8.dp))
+                Text(if (viewModel.language == AppLanguage.RU) "Показать обучение" else "Show Tutorial")
+            }
+            Spacer(modifier = Modifier.height(32.dp))
         }
     }
 
@@ -2345,6 +2910,8 @@ fun DebugMenuDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
         }
     }
 }
+
+
 
 @Composable
 fun AppSelectionDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
@@ -2467,3 +3034,192 @@ enum class AppDestinations(val icon: androidx.compose.ui.graphics.vector.ImageVe
     LOGS(Icons.AutoMirrored.Filled.List),
     SETTINGS(Icons.Default.Settings),
 }
+
+@Composable
+fun Modifier.tutorialHighlight(enabled: Boolean): Modifier {
+    val infiniteTransition = rememberInfiniteTransition(label = "tutorial")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.05f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "scale"
+    )
+    
+    return if (enabled) {
+        this.then(
+            Modifier
+                .graphicsLayer(scaleX = scale, scaleY = scale)
+                .border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.medium)
+                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), MaterialTheme.shapes.medium)
+        )
+    } else this
+}
+
+@Composable
+fun OnboardingGuide(viewModel: AppViewModel) {
+    val isRu = viewModel.language == AppLanguage.RU
+
+    LaunchedEffect(viewModel.showGuide) {
+        if (viewModel.showGuide) {
+            viewModel.currentTutorialStep = 1
+        }
+    }
+
+    if (viewModel.currentTutorialStep == 0 && !viewModel.hasSeenGuide) {
+        AlertDialog(
+            onDismissRequest = { viewModel.setGuideSeen() },
+            title = { Text(if (isRu) "Добро пожаловать!" else "Welcome!") },
+            text = { Text(if (isRu) "Хотите пройти краткое обучение по работе с приложением?" else "Would you like a short tutorial on how to use the app?") },
+            confirmButton = {
+                Button(onClick = { viewModel.currentTutorialStep = 1 }) {
+                    Text(if (isRu) "Да, обучите меня" else "Yes, show me")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.setGuideSeen() }) {
+                    Text(if (isRu) "Пропустить" else "Skip")
+                }
+            }
+        )
+    }
+
+    if (viewModel.currentTutorialStep > 0) {
+        // Handle screen transitions during tutorial
+        LaunchedEffect(viewModel.currentTutorialStep) {
+            when (viewModel.currentTutorialStep) {
+                1, 9 -> viewModel.currentDestination = AppDestinations.HOME
+                2 -> viewModel.currentDestination = AppDestinations.SETTINGS
+                3, 4, 5, 6, 7, 8 -> viewModel.currentDestination = AppDestinations.SERVERS
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.4f)) // Lighter dimming
+                .clickable(enabled = false) {} 
+        ) {
+            val content = when (viewModel.currentTutorialStep) {
+                1 -> StepContent(
+                    if (isRu) "Добро пожаловать" else "Welcome",
+                    if (isRu) "Давайте быстро разберемся, как пользоваться приложением." else "Let's quickly learn how to use the app.",
+                    Alignment.Center
+                )
+                2 -> StepContent(
+                    if (isRu) "Источники серверов" else "Server Sources",
+                    if (isRu) "В настройках нажмите 'Выбрать конфигурации', чтобы отметить нужные списки серверов." else "In settings, tap 'Select Configurations' to check the desired server lists.",
+                    Alignment.Center
+                )
+                3 -> StepContent(
+                    if (isRu) "Раздел Серверы" else "Servers Section",
+                    if (isRu) "Теперь перейдем во вкладку со списком серверов." else "Now let's go to the servers list tab.",
+                    Alignment.TopCenter
+                )
+                4 -> StepContent(
+                    if (isRu) "Загрузка серверов" else "Download Servers",
+                    if (isRu) "Нажмите на иконку загрузки, чтобы получить список свежих серверов из выбранных источников." else "Tap the download icon to fetch fresh servers from selected sources.",
+                    Alignment.Center
+                )
+                5 -> StepContent(
+                    if (isRu) "Проверка пинга" else "Check Ping",
+                    if (isRu) "Кнопка 'Проверить' замерит задержку до каждого сервера. Чем меньше число, тем лучше!" else "The 'Check' button measures delay to each server. Lower is better!",
+                    Alignment.Center
+                )
+                6 -> StepContent(
+                    if (isRu) "Пинг Telegram" else "Telegram Ping",
+                    if (isRu) "Иконка самолетика проверит связь именно с Telegram. Это поможет найти лучший сервер для мессенджера." else "The airplane icon checks connection specifically to Telegram. It helps find the best server for the app.",
+                    Alignment.Center
+                )
+                7 -> StepContent(
+                    if (isRu) "Сортировка" else "Sorting",
+                    if (isRu) "Используйте эту кнопку, чтобы отсортировать серверы по пингу, стране или скорости Telegram." else "Use this button to sort servers by ping, country, or Telegram speed.",
+                    Alignment.TopCenter
+                )
+                8 -> StepContent(
+                    if (isRu) "Выбор сервера" else "Select Server",
+                    if (isRu) "Просто нажмите на любой сервер в списке, чтобы выбрать его для подключения." else "Just tap any server in the list to select it for connection.",
+                    Alignment.BottomCenter
+                )
+                9 -> StepContent(
+                    if (isRu) "Подключение" else "Connection",
+                    if (isRu) "Теперь всё готово! Возвращайтесь на главную и жмите кнопку питания для запуска VPN." else "Now everything is ready! Go back to Home and tap the power button to start the VPN.",
+                    Alignment.TopCenter
+                )
+                else -> StepContent("", "", Alignment.Center)
+            }
+
+            // Guidance card
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(32.dp)
+            ) {
+                Card(
+                    modifier = Modifier
+                        .align(content.alignment)
+                        .fillMaxWidth()
+                        .padding(
+                            bottom = if (content.alignment == Alignment.BottomCenter) 80.dp else 0.dp,
+                            top = if (content.alignment == Alignment.TopCenter) 80.dp else 0.dp
+                        ),
+                    shape = MaterialTheme.shapes.large,
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = content.title,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = content.description,
+                            style = MaterialTheme.typography.bodyLarge,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(24.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(onClick = { viewModel.completeGuide() }) {
+                                Text(if (isRu) "Пропустить" else "Skip")
+                            }
+                            Button(
+                                onClick = {
+                                    if (viewModel.currentTutorialStep < 9) viewModel.currentTutorialStep++ else viewModel.completeGuide()
+                                }
+                            ) {
+                                Text(if (viewModel.currentTutorialStep < 9) (if (isRu) "Далее" else "Next") else (if (isRu) "Понятно" else "Got it"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+val AppViewModel.tutorialStep: Int
+    @Composable get() = (MainActivity.instance?.viewModel as? AppViewModel)?.let { vm ->
+        var step by remember { mutableIntStateOf(0) }
+        // This is a bit of a hack to observe the internal step of OnboardingGuide
+        // but since they share the same ViewModel context, we can add a property to ViewModel
+        vm.currentTutorialStep
+    } ?: 0
+
+// Add this to AppViewModel class
+
+data class StepContent(
+    val title: String,
+    val description: String,
+    val alignment: Alignment
+)

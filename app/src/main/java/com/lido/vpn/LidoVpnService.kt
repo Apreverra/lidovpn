@@ -93,13 +93,17 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
             val killSwitch = intent.getBooleanExtra("KILL_SWITCH", false)
             val ipv6Enabled = intent.getBooleanExtra("IPV6_ENABLED", false)
             val utlsFingerprint = intent.getStringExtra("UTLS_FINGERPRINT") ?: "chrome"
+            val dpiPackets = intent.getStringExtra("DPI_PACKETS") ?: "tlshello"
+            val dpiLength = intent.getStringExtra("DPI_LENGTH") ?: "100-200"
+            val dpiInterval = intent.getStringExtra("DPI_INTERVAL") ?: "10-20"
+            val dpiEngine = intent.getStringExtra("DPI_ENGINE") ?: "Xray"
 
             val appFilterEnabled = intent.getBooleanExtra("APP_FILTER_ENABLED", false)
             val appFilterBypass = intent.getBooleanExtra("APP_FILTER_BYPASS", false)
             val selectedApps = intent.getStringArrayExtra("SELECTED_APPS")?.toList() ?: emptyList()
 
             showNotification(serverName)
-            startVpn(server, dns, sniffing, mux, fragment, mtu, routingMode, appFilterEnabled, appFilterBypass, selectedApps, killSwitch, ipv6Enabled, utlsFingerprint)
+            startVpn(server, dns, sniffing, mux, fragment, mtu, routingMode, appFilterEnabled, appFilterBypass, selectedApps, killSwitch, ipv6Enabled, utlsFingerprint, dpiPackets, dpiLength, dpiInterval, dpiEngine)
             sendStateBroadcast(isConnected = true)
         } else if (action == ACTION_STOP) {
             stopVpn()
@@ -173,7 +177,11 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
         selectedApps: List<String> = emptyList(),
         killSwitch: Boolean = false,
         ipv6Enabled: Boolean = false,
-        utlsFingerprint: String = "chrome"
+        utlsFingerprint: String = "chrome",
+        dpiPackets: String = "tlshello",
+        dpiLength: String = "100-200",
+        dpiInterval: String = "10-20",
+        dpiEngine: String = "Xray"
     ) {
         if ((vpnInterface != null) || (coreController != null)) {
             sendLogToActivity("Reconnecting...")
@@ -271,6 +279,14 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
                 android.system.Os.setenv("V2RAY_LOCATION_ASSET", assetPath, true)
             } catch (_: Exception) {}
 
+            val isDpiOnlyMode = server.type == "DPI_ONLY"
+            if (isDpiOnlyMode) {
+                // Запускаем внешний бинарник ByeDPI только в режиме DPI Only
+                val prefs = getSharedPreferences("vpn_settings", MODE_PRIVATE)
+                val fullCmd = prefs.getString("dpi_command", "-o1 -d1 -s1") ?: "-o1 -d1 -s1"
+                ByeDPIController.start(this, fullCmd, 1080)
+            }
+
             val config = XrayConfigGenerator.generateConfig(
                 server = server,
                 dns = dns,
@@ -280,7 +296,11 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
                 routingMode = routingMode,
                 mtu = mtu,
                 assetPath = assetPath,
-                utlsFingerprint = utlsFingerprint
+                utlsFingerprint = utlsFingerprint,
+                dpiPackets = dpiPackets,
+                dpiLength = dpiLength,
+                dpiInterval = dpiInterval,
+                socksProxyPort = if (isDpiOnlyMode) 1080 else 0
             )
             
             coreController = Libv2ray.newCoreController(this)
@@ -297,6 +317,7 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
     private fun stopVpn() {
         sendLogToActivity("Disconnecting...")
         sendStateBroadcast(isConnected = false)
+        ByeDPIController.stop()
         try {
             coreController?.stopLoop()
         } catch (_: Exception) {}

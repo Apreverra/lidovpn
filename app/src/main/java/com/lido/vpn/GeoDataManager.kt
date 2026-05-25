@@ -23,17 +23,20 @@ object GeoDataManager {
         val size: Long, 
         val lastModified: Long, 
         val exists: Boolean,
+        val localVersion: String = "",
         val remoteVersion: String = "",
     )
 
     fun getGeoFilesInfo(context: Context): List<GeoFileInfo> {
+        val prefs = context.getSharedPreferences("geo_prefs", Context.MODE_PRIVATE)
         return listOf("geoip.dat", "geosite.dat").map { fileName ->
             val file = File(context.filesDir, fileName)
             GeoFileInfo(
                 name = fileName,
                 size = if (file.exists()) file.length() else 0,
                 lastModified = if (file.exists()) file.lastModified() else 0,
-                exists = file.exists()
+                exists = file.exists(),
+                localVersion = prefs.getString("version_$fileName", "") ?: ""
             )
         }
     }
@@ -58,6 +61,7 @@ object GeoDataManager {
 
     suspend fun downloadGeoFiles(context: Context, onProgress: (String) -> Unit): Boolean {
         return withContext(Dispatchers.IO) {
+            val remoteVersions = getRemoteVersions()
             val files = listOf(
                 "geoip.dat" to GEOIP_URL,
                 "geosite.dat" to GEOSITE_URL
@@ -80,6 +84,13 @@ object GeoDataManager {
                         FileOutputStream(file).use { output ->
                             body.byteStream().copyTo(output)
                         }
+                        
+                        // Save local version
+                        remoteVersions[name]?.let { tag ->
+                            context.getSharedPreferences("geo_prefs", Context.MODE_PRIVATE)
+                                .edit().putString("version_$name", tag).apply()
+                        }
+
                         onProgress("$name updated successfully")
                     }
                 } catch (e: Exception) {
