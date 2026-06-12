@@ -1,2 +1,2 @@
 # lidovpn
-local sheeet
+:)
