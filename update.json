@@ -1,6 +1,6 @@
 {
   "version": "1.0.5",
-  "description": "Release v1.0.5:\n- Фикс многочисленных багов и небольшой редизайн.",
+  "description": "- Фикс многочисленных багов и небольшой редизайн.",
   "downloadUrl": "https://github.com/Apreverra/lidovpn/releases/download/app-1.0.5/app-universal-release.apk",
   "forceUpdate": false
 }
