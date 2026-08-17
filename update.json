@@ -1,6 +1,6 @@
 {
-  "version": "1.0.4",
-  "description": "Список изменений:\n- Полный редизайн интерфейса.\n- Поддержка управления пультом и D-pad для Android TV.\n- Добавлены «Простой» и «Продвинутый» режимы.\n- Выбор региона и настройка ресурсов на главном экране.\n- Иконки работающих сервисов в карточке сервера.\n- Умный подбор сервера по всем выбранным ресурсам.\n- Уменьшение размера APK (ABI Splits).\n- Улучшенная синхронизация настроек.",
-  "downloadUrl": "https://github.com/Apreverra/lidovpn/releases/download/app-1.0.4/app-universal-release.apk",
+  "version": "1.0.5",
+  "description": "Release v1.0.5:\n- Фикс многочисленных багов и небольшой редизайн.",
+  "downloadUrl": "https://github.com/Apreverra/lidovpn/releases/download/app-1.0.5/app-universal-release.apk",
   "forceUpdate": false
 }
