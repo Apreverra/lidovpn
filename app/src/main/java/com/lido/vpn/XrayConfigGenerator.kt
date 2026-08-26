@@ -3,285 +3,365 @@ package com.lido.vpn
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonObject
 import com.google.gson.JsonArray
+import java.io.File
 
 object XrayConfigGenerator {
     private val gson = GsonBuilder().setPrettyPrinting().create()
 
     fun generateConfig(
-        server: VpnServer, 
-        dns: String, 
-        sniffing: Boolean, 
-        mux: Boolean, 
-        fragment: Boolean,
-        routingMode: String = "BYPASS_LAN_RU",
-        mtu: Int = 1500,
+        server: VpnServer,
+        dns: String,
+        sniffing: Boolean,
+        mux: Boolean,
+        routingMode: String = "GLOBAL",
+        @Suppress("UNUSED_PARAMETER") mtu: Int = 1500,
         assetPath: String = "",
         utlsFingerprint: String = "chrome",
-        dpiPackets: String = "tlshello",
-        dpiLength: String = "100-200",
-        dpiInterval: String = "10-20",
         isTestConfig: Boolean = false,
-        socksProxyPort: Int = 0
+        socksProxyPort: Int = 0,
+        socksInboundPort: Int = 10808,
     ): String {
         val config = JsonObject()
-        
-        val log = JsonObject()
-        log.addProperty("loglevel", "error")
-        config.add("log", log)
+        config.add("log", createLog())
 
         val inbounds = JsonArray()
+        val outbounds = JsonArray()
+        val rules = JsonArray()
+
+        val sniffingObj = createSniffing(sniffing)
+
         if (!isTestConfig) {
-            val tunInbound = JsonObject()
-            tunInbound.addProperty("protocol", "tun")
-            tunInbound.addProperty("tag", "tun-in")
-            val tunSettings = JsonObject()
-            tunSettings.addProperty("mtu", mtu)
-            tunInbound.add("settings", tunSettings)
-            
-            val sniffingObj = JsonObject()
-            sniffingObj.addProperty("enabled", sniffing)
-            val destOverride = JsonArray()
-            destOverride.add("http")
-            destOverride.add("tls")
-            sniffingObj.add("destOverride", destOverride)
-            tunInbound.add("sniffing", sniffingObj)
-            inbounds.add(tunInbound)
-            
-            val socksInbound = JsonObject()
-            socksInbound.addProperty("port", 10808)
-            socksInbound.addProperty("protocol", "socks")
-            val socksSettings = JsonObject()
-            socksSettings.addProperty("udp", true)
-            socksInbound.add("settings", socksSettings)
-            inbounds.add(socksInbound)
+            inbounds.add(createTunInbound(mtu, sniffingObj))
+            inbounds.add(createSocksInbound(socksInboundPort, "socks-in", sniffingObj))
         } else {
-            val testInbound = JsonObject()
-            testInbound.addProperty("protocol", "socks")
-            testInbound.addProperty("port", 1080)
-            inbounds.add(testInbound)
+            inbounds.add(createSocksInbound(socksInboundPort, null, null))
         }
         config.add("inbounds", inbounds)
 
-        val outbounds = JsonArray()
-        val isDpiOnly = server.type == "DPI_ONLY"
-        
         if (socksProxyPort > 0) {
-            val socksOutbound = JsonObject()
-            socksOutbound.addProperty("protocol", "socks")
-            socksOutbound.addProperty("tag", "proxy")
-            val settings = JsonObject()
-            val servers = JsonArray()
-            val node = JsonObject()
-            node.addProperty("address", "127.0.0.1")
-            node.addProperty("port", socksProxyPort)
-            servers.add(node)
-            settings.add("servers", servers)
-            socksOutbound.add("settings", settings)
-            outbounds.add(socksOutbound)
+            outbounds.add(createSocksOutbound("proxy", "127.0.0.1", socksProxyPort))
         } else {
-            if (isDpiOnly || fragment) {
-                val baseDialer = if (isDpiOnly) "direct" else "proxy"
-                val lengths = dpiLength.split(",")
-                
-                if (lengths.size > 1) {
-                    // Создаем цепочку из нескольких outbounds для каждой позиции разреза
-                    lengths.forEachIndexed { index, len ->
-                        val tag = "fragment-out-$index"
-                        val nextTag = if (index == lengths.size - 1) baseDialer else "fragment-out-${index + 1}"
-                        
-                        val out = JsonObject()
-                        out.addProperty("protocol", "freedom")
-                        out.addProperty("tag", tag)
-                        
-                        val settings = JsonObject()
-                        val frag = JsonObject()
-                        if (dpiPackets != "all") {
-                            frag.addProperty("packets", dpiPackets)
-                        }
-                        frag.addProperty("length", len)
-                        frag.addProperty("interval", dpiInterval)
-                        settings.add("fragment", frag)
-                        out.add("settings", settings)
-                        
-                        val stream = JsonObject()
-                        val sockopt = JsonObject()
-                        sockopt.addProperty("dialerProxy", nextTag)
-                        stream.add("sockopt", sockopt)
-                        out.add("streamSettings", stream)
-                        
-                        outbounds.add(out)
-                    }
-                } else {
-                    // Обычный одиночный фрагмент
-                    val out = JsonObject()
-                    out.addProperty("protocol", "freedom")
-                    out.addProperty("tag", "fragment-out")
-                    
-                    val settings = JsonObject()
-                    val frag = JsonObject()
-                    if (dpiPackets != "all") {
-                        frag.addProperty("packets", dpiPackets)
-                    }
-                    frag.addProperty("length", dpiLength)
-                    frag.addProperty("interval", dpiInterval)
-                    settings.add("fragment", frag)
-                    out.add("settings", settings)
-                    
-                    val stream = JsonObject()
-                    val sockopt = JsonObject()
-                    sockopt.addProperty("dialerProxy", baseDialer)
-                    stream.add("sockopt", sockopt)
-                    out.add("streamSettings", stream)
-                    
-                    outbounds.add(out)
-                }
-            }
-
-            if (!isDpiOnly) {
-                val proxyOutbound = JsonObject()
-                var protocol = server.type.lowercase()
-                if (protocol == "ss") protocol = "shadowsocks"
-                proxyOutbound.addProperty("protocol", protocol)
-                proxyOutbound.addProperty("tag", "proxy")
-                
-                val settings = JsonObject()
-                when (protocol) {
-                    "vless" -> {
-                        val vnext = JsonArray()
-                        val node = JsonObject()
-                        node.addProperty("address", server.host)
-                        node.addProperty("port", server.port)
-                        val users = JsonArray()
-                        val user = JsonObject()
-                        user.addProperty("id", server.uuid)
-                        user.addProperty("encryption", "none")
-                        users.add(user)
-                        node.add("users", users)
-                        vnext.add(node)
-                        settings.add("vnext", vnext)
-                    }
-                    "vmess" -> {
-                        val vnext = JsonArray()
-                        val node = JsonObject()
-                        node.addProperty("address", server.host)
-                        node.addProperty("port", server.port)
-                        val users = JsonArray()
-                        val user = JsonObject()
-                        user.addProperty("id", server.uuid)
-                        users.add(user)
-                        node.add("users", users)
-                        vnext.add(node)
-                        settings.add("vnext", vnext)
-                    }
-                    "trojan" -> {
-                        val servers = JsonArray()
-                        val node = JsonObject()
-                        node.addProperty("address", server.host)
-                        node.addProperty("port", server.port)
-                        node.addProperty("password", server.uuid)
-                        servers.add(node)
-                        settings.add("servers", servers)
-                    }
-                    "shadowsocks" -> {
-                        val servers = JsonArray()
-                        val node = JsonObject()
-                        node.addProperty("address", server.host)
-                        node.addProperty("port", server.port)
-                        val userInfo = server.uuid
-                        if (userInfo.contains(":")) {
-                            val parts = userInfo.split(":")
-                            node.addProperty("method", parts[0])
-                            node.addProperty("password", parts[1])
-                        } else {
-                            node.addProperty("method", "aes-256-gcm")
-                            node.addProperty("password", userInfo)
-                        }
-                        servers.add(node)
-                        settings.add("servers", servers)
-                    }
-                }
-                proxyOutbound.add("settings", settings)
-
-                val streamSettings = JsonObject()
-                val network = server.params["net"] ?: server.params["type"] ?: "tcp"
-                streamSettings.addProperty("network", network)
-                
-                val security = server.params["security"] ?: "none"
-                streamSettings.addProperty("security", security)
-                
-                if (security == "tls" || security == "reality") {
-                    val tlsKey = if (security == "reality") "realitySettings" else "tlsSettings"
-                    val tlsObj = JsonObject()
-                    tlsObj.addProperty("serverName", server.params["sni"] ?: server.host)
-                    tlsObj.addProperty("fingerprint", server.params["fp"] ?: utlsFingerprint)
-                    if (security == "reality") {
-                        tlsObj.addProperty("publicKey", server.params["pbk"] ?: "")
-                        tlsObj.addProperty("shortId", server.params["sid"] ?: "")
-                    }
-                    streamSettings.add(tlsKey, tlsObj)
-                }
-                proxyOutbound.add("streamSettings", streamSettings)
-                outbounds.add(proxyOutbound)
-            }
+            outbounds.add(buildMainOutbound(server, mux, utlsFingerprint))
         }
 
-        val directOutbound = JsonObject()
-        directOutbound.addProperty("protocol", "freedom")
-        directOutbound.addProperty("tag", "direct")
-        outbounds.add(directOutbound)
-
-        val dnsOutbound = JsonObject()
-        dnsOutbound.addProperty("protocol", "dns")
-        dnsOutbound.addProperty("tag", "dns-out")
-        outbounds.add(dnsOutbound)
-
+        outbounds.add(createProtocolOutbound("freedom", "direct"))
+        outbounds.add(createProtocolOutbound("dns", "dns-out"))
         config.add("outbounds", outbounds)
 
-        val routing = JsonObject()
-        routing.addProperty("domainStrategy", "IPIfNonMatch")
-        val rules = JsonArray()
-        
-        val dnsRule = JsonObject()
-        dnsRule.addProperty("type", "field")
-        dnsRule.addProperty("outboundTag", "dns-out")
-        dnsRule.addProperty("port", 53)
-        rules.add(dnsRule)
-        
-        val effectiveMainTag = if (socksProxyPort > 0) {
-            "proxy"
-        } else if (isDpiOnly || fragment) {
-             if (dpiLength.contains(",")) "fragment-out-0" else "fragment-out"
-        } else {
-            "proxy"
-        }
+        // Routing
+        rules.add(createFieldRule(outboundTag = "dns-out", port = 53))
 
         if (routingMode == "BYPASS_LAN_RU") {
-            val lanRule = JsonObject()
-            lanRule.addProperty("type", "field")
-            lanRule.addProperty("outboundTag", "direct")
-            val lanIp = JsonArray().apply { add("10.0.0.0/8"); add("172.16.0.0/12"); add("192.168.0.0/16") }
-            lanRule.add("ip", lanIp)
-            rules.add(lanRule)
+            rules.add(createFieldRule(outboundTag = "direct", ip = listOf("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
+            
+            rules.add(createFieldRule(
+                outboundTag = "proxy",
+                domain = listOf("domain:t.me", "domain:tdesktop.com", "domain:telegram.org", "domain:telegram.me", "domain:telegra.ph", "domain:telegram.dog")
+            ))
+
+            val hasGeoIp = if (assetPath.isNotEmpty()) File(assetPath, "geoip.dat").exists() else false
+            val hasGeoSite = if (assetPath.isNotEmpty()) File(assetPath, "geosite.dat").exists() else false
+
+            if (hasGeoIp) rules.add(createFieldRule(outboundTag = "direct", ip = listOf("geoip:geoip.dat:ru")))
+            if (hasGeoSite) rules.add(createFieldRule(outboundTag = "direct", domain = listOf("geosite:geosite.dat:ru")))
         }
 
-        val mainRule = JsonObject()
-        mainRule.addProperty("type", "field")
-        mainRule.addProperty("outboundTag", effectiveMainTag)
-        mainRule.addProperty("network", "udp,tcp")
-        rules.add(mainRule)
+        rules.add(createFieldRule(outboundTag = "proxy", network = "udp,tcp"))
+        
+        config.add("routing", JsonObject().apply {
+            addProperty("domainStrategy", "IPIfNonMatch")
+            add("rules", rules)
+        })
 
-        routing.add("rules", rules)
-        config.add("routing", routing)
-
-        val dnsObj = JsonObject()
-        val dnsServers = JsonArray()
-        val dnsSrv = JsonObject()
-        dnsSrv.addProperty("address", dns)
-        dnsSrv.addProperty("port", 53)
-        dnsServers.add(dnsSrv)
-        dnsObj.add("servers", dnsServers)
-        config.add("dns", dnsObj)
+        config.add("dns", createDns(dns))
 
         return gson.toJson(config)
+    }
+
+    fun generateByeDpiBridgeConfig(
+        byeDpiAddress: String = "127.0.0.1",
+        byeDpiPort: Int,
+        dns: String,
+        mtu: Int
+    ): String {
+        return JsonObject().apply {
+            add("log", createLog())
+            add("inbounds", JsonArray().apply { add(createTunInbound(mtu, null)) })
+            add("outbounds", JsonArray().apply {
+                add(createSocksOutbound("proxy", byeDpiAddress, byeDpiPort))
+                add(createProtocolOutbound("dns", "dns-out"))
+            })
+            add("routing", JsonObject().apply {
+                addProperty("domainStrategy", "IPIfNonMatch")
+                add("rules", JsonArray().apply {
+                    add(createFieldRule(outboundTag = "dns-out", port = 53))
+                    add(createFieldRule(outboundTag = "proxy", network = "tcp,udp"))
+                })
+            })
+            add("dns", createDns(dns))
+        }.let { gson.toJson(it) }
+    }
+
+    // --- Helpers ---
+
+    private fun createLog() = JsonObject().apply {
+        addProperty("loglevel", "error")
+    }
+
+    private fun createSniffing(enabled: Boolean) = JsonObject().apply {
+        addProperty("enabled", enabled)
+        add("destOverride", JsonArray().apply { add("http"); add("tls") })
+    }
+
+    private fun createDns(dns: String) = JsonObject().apply {
+        addProperty("domainStrategy", "AsIs")
+        add("servers", JsonArray().apply {
+            add(JsonObject().apply {
+                addProperty("address", dns)
+                addProperty("port", 53)
+            })
+        })
+    }
+
+    private fun createTunInbound(mtu: Int, sniffing: JsonObject?) = JsonObject().apply {
+        addProperty("protocol", "tun")
+        addProperty("tag", "tun-in")
+        add("settings", JsonObject().apply {
+            addProperty("mtu", mtu)
+            addProperty("stack", "gvisor")
+        })
+        sniffing?.let { add("sniffing", it) }
+    }
+
+    private fun createSocksInbound(port: Int, tag: String?, sniffing: JsonObject?) = JsonObject().apply {
+        addProperty("protocol", "socks")
+        addProperty("port", port)
+        tag?.let { addProperty("tag", it) }
+        add("settings", JsonObject().apply { addProperty("udp", true) })
+        sniffing?.let { add("sniffing", it) }
+    }
+
+    private fun createProtocolOutbound(protocol: String, tag: String) = JsonObject().apply {
+        addProperty("protocol", protocol)
+        addProperty("tag", tag)
+    }
+
+    private fun createSocksOutbound(tag: String, host: String, port: Int) = JsonObject().apply {
+        addProperty("protocol", "socks")
+        addProperty("tag", tag)
+        add("settings", JsonObject().apply {
+            add("servers", JsonArray().apply {
+                add(JsonObject().apply {
+                    addProperty("address", host)
+                    addProperty("port", port)
+                })
+            })
+        })
+    }
+
+    private fun createFieldRule(
+        outboundTag: String,
+        port: Int? = null,
+        ip: List<String>? = null,
+        domain: List<String>? = null,
+        inboundTag: List<String>? = null,
+        network: String? = null
+    ) = JsonObject().apply {
+        addProperty("type", "field")
+        addProperty("outboundTag", outboundTag)
+        port?.let { addProperty("port", it) }
+        network?.let { addProperty("network", it) }
+        ip?.let { list -> add("ip", JsonArray().apply { list.forEach { add(it) } }) }
+        domain?.let { list -> add("domain", JsonArray().apply { list.forEach { add(it) } }) }
+        inboundTag?.let { list -> add("inboundTag", JsonArray().apply { list.forEach { add(it) } }) }
+    }
+
+    private fun buildMainOutbound(server: VpnServer, mux: Boolean, utlsFingerprint: String): JsonObject {
+        val proxyOutbound = JsonObject()
+        val protocol = server.type.lowercase().let {
+            when(it) {
+                "ss" -> "shadowsocks"
+                "socks5", "socks4" -> "socks"
+                "hysteria2", "hy2" -> "hysteria2"
+                "tuic" -> "tuic"
+                else -> it
+            }
+        }
+        
+        proxyOutbound.addProperty("protocol", protocol)
+        proxyOutbound.addProperty("tag", "proxy")
+        
+        val settings = JsonObject()
+        when (protocol) {
+            "vless" -> {
+                settings.add("vnext", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("address", server.host)
+                        addProperty("port", server.port)
+                        add("users", JsonArray().apply {
+                            add(JsonObject().apply {
+                                addProperty("id", server.uuid)
+                                addProperty("encryption", "none")
+                                server.params["flow"]?.takeIf { it.isNotEmpty() }?.let { addProperty("flow", it) }
+                            })
+                        })
+                    })
+                })
+            }
+            "vmess" -> {
+                settings.add("vnext", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("address", server.host)
+                        addProperty("port", server.port)
+                        add("users", JsonArray().apply {
+                            add(JsonObject().apply {
+                                addProperty("id", server.uuid)
+                                addProperty("security", server.params["scy"] ?: "auto")
+                                addProperty("alterId", server.params["aid"]?.toIntOrNull() ?: 0)
+                            })
+                        })
+                    })
+                })
+            }
+            "trojan" -> {
+                settings.add("servers", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("address", server.host)
+                        addProperty("port", server.port)
+                        addProperty("password", server.uuid)
+                    })
+                })
+            }
+            "shadowsocks" -> {
+                settings.add("servers", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("address", server.host)
+                        addProperty("port", server.port)
+                        if (server.uuid.contains(":")) {
+                            server.uuid.split(":").let {
+                                addProperty("method", it[0])
+                                addProperty("password", it[1])
+                            }
+                        } else {
+                            addProperty("method", "aes-256-gcm")
+                            addProperty("password", server.uuid)
+                        }
+                    })
+                })
+            }
+            "socks" -> {
+                settings.add("servers", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("address", server.host)
+                        addProperty("port", server.port)
+                        addProperty("version", server.params["version"] ?: "5")
+                        if (server.uuid.isNotEmpty()) {
+                            add("users", JsonArray().apply {
+                                add(JsonObject().apply {
+                                    if (server.uuid.contains(":")) {
+                                        server.uuid.split(":").let {
+                                            addProperty("user", it[0])
+                                            addProperty("pass", it[1])
+                                        }
+                                    } else {
+                                        addProperty("user", server.uuid)
+                                    }
+                                })
+                            })
+                        }
+                    })
+                })
+            }
+            "hysteria2" -> {
+                settings.add("servers", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("address", server.host)
+                        addProperty("port", server.port)
+                        addProperty("password", server.uuid)
+                    })
+                })
+            }
+            "tuic" -> {
+                settings.add("servers", JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("address", server.host)
+                        addProperty("port", server.port)
+                        addProperty("uuid", server.uuid)
+                        addProperty("password", server.params["pass"] ?: "")
+                        addProperty("congestionControl", server.params["congestion_control"] ?: "bbr")
+                        addProperty("udpRelayMode", "native")
+                    })
+                })
+            }
+        }
+        proxyOutbound.add("settings", settings)
+
+        val streamSettings = JsonObject().apply {
+            val defaultNet = when (protocol) {
+                "hysteria2", "tuic" -> "udp"
+                else -> "tcp"
+            }
+            val defaultSec = when (protocol) {
+                "hysteria2", "tuic" -> "tls"
+                else -> "none"
+            }
+
+            val network = server.params["net"] ?: server.params["type"] ?: defaultNet
+            addProperty("network", network)
+            
+            when (network) {
+                "ws" -> {
+                    add("wsSettings", JsonObject().apply {
+                        addProperty("path", server.params["path"] ?: "/")
+                        server.params["host"]?.takeIf { it.isNotEmpty() }?.let { 
+                            addProperty("host", it)
+                            add("headers", JsonObject().apply { addProperty("Host", it) })
+                        }
+                    })
+                }
+                "grpc" -> {
+                    add("grpcSettings", JsonObject().apply {
+                        addProperty("serviceName", server.params["serviceName"] ?: server.params["path"] ?: "")
+                    })
+                }
+                "h2", "http" -> {
+                    add("httpSettings", JsonObject().apply {
+                        addProperty("path", server.params["path"] ?: "/")
+                        add("host", JsonArray().apply {
+                            server.params["host"]?.split(",")?.forEach { add(it.trim()) }
+                        })
+                    })
+                }
+            }
+            
+            val security = server.params["security"] ?: defaultSec
+            addProperty("security", security)
+            
+            if (security == "tls" || security == "reality") {
+                val tlsObj = JsonObject().apply {
+                    addProperty("serverName", server.params["sni"] ?: server.host)
+                    addProperty("fingerprint", server.params["fp"] ?: utlsFingerprint)
+                    if (server.params["insecure"] == "true") addProperty("allowInsecure", true)
+                    server.params["alpn"]?.takeIf { it.isNotEmpty() }?.let { alpn ->
+                        add("alpn", JsonArray().apply { alpn.split(",").forEach { add(it.trim()) } })
+                    }
+                    if (security == "reality") {
+                        addProperty("publicKey", server.params["pbk"] ?: "")
+                        addProperty("shortId", server.params["sid"] ?: "")
+                    }
+                }
+                add(if (security == "reality") "realitySettings" else "tlsSettings", tlsObj)
+            }
+        }
+        proxyOutbound.add("streamSettings", streamSettings)
+        
+        if (mux && protocol != "shadowsocks") {
+            proxyOutbound.add("mux", JsonObject().apply {
+                addProperty("enabled", true)
+                addProperty("concurrency", 8)
+            })
+        }
+        
+        return proxyOutbound
     }
 }

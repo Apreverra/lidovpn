@@ -1,0 +1,6 @@
+{
+  "version": "1.0.5",
+  "description": "Release v1.0.5:\n- Улучшена настройка сервисов в простом режиме.\n- Исправлены ошибки в диалогах.\n- Оптимизирована работа с настройками.\n- Добавлена поддержка BuildConfig.",
+  "downloadUrl": "https://github.com/Apreverra/lidovpn/releases/download/v1.0.5/app-release.apk",
+  "forceUpdate": false
+}

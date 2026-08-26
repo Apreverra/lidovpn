@@ -20,6 +20,18 @@ class VpnApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        
+        // Устанавливаем пути к гео-данным максимально рано и надежно
+        val assetPath = filesDir.absolutePath
+        System.setProperty("v2ray.location.asset", assetPath)
+        System.setProperty("xray.location.asset", assetPath)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                android.system.Os.setenv("XRAY_LOCATION_ASSET", assetPath, true)
+                android.system.Os.setenv("V2RAY_LOCATION_ASSET", assetPath, true)
+            } catch (_: Exception) {}
+        }
+
         copyAssetsIfNeeded()
         
         val filter = IntentFilter("VPN_LOG")

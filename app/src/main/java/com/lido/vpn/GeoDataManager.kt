@@ -12,7 +12,11 @@ import java.util.Date
 import java.util.Locale
 
 object GeoDataManager {
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+
     private const val GEOIP_URL = "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
     private const val GEOSITE_URL = "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
     private const val GEOIP_API = "https://api.github.com/repos/v2fly/geoip/releases/latest"
@@ -43,6 +47,7 @@ object GeoDataManager {
 
     suspend fun getRemoteVersions(): Map<String, String> {
         return withContext(Dispatchers.IO) {
+            LogManager.addLog("[GitHub] Getting remote versions for geo files...")
             val versions = mutableMapOf<String, String>()
             listOf("geoip.dat" to GEOIP_API, "geosite.dat" to GEOSITE_API).forEach { (name, url) ->
                 try {
@@ -50,10 +55,16 @@ object GeoDataManager {
                     client.newCall(request).execute().use { response ->
                         if (response.isSuccessful) {
                             val json = JSONObject(response.body?.string() ?: "")
-                            versions[name] = json.optString("tag_name", "unknown")
+                            val tag = json.optString("tag_name", "unknown")
+                            versions[name] = tag
+                            LogManager.addLog("[GitHub] $name remote version: $tag")
+                        } else {
+                            LogManager.addLog("[GitHub] Failed to get $name tag: ${response.code}")
                         }
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    LogManager.addLog("[GitHub] Error getting $name tag: ${e.message}")
+                }
             }
             versions
         }
@@ -61,6 +72,7 @@ object GeoDataManager {
 
     suspend fun downloadGeoFiles(context: Context, onProgress: (String) -> Unit): Boolean {
         return withContext(Dispatchers.IO) {
+            LogManager.addLog("[GitHub] Starting geo update...")
             val remoteVersions = getRemoteVersions()
             val files = listOf(
                 "geoip.dat" to GEOIP_URL,
@@ -70,10 +82,12 @@ object GeoDataManager {
             var allSuccess = true
             files.forEach { (name, url) ->
                 try {
+                    LogManager.addLog("[GitHub] Downloading $name...")
                     onProgress("Downloading $name...")
                     val request = Request.Builder().url(url).build()
                     client.newCall(request).execute().use { response ->
                         if (!response.isSuccessful) {
+                            LogManager.addLog("[GitHub] Failed to download $name: ${response.code}")
                             onProgress("Failed to download $name: ${response.message}")
                             allSuccess = false
                             return@forEach
@@ -91,13 +105,16 @@ object GeoDataManager {
                                 .edit().putString("version_$name", tag).apply()
                         }
 
+                        LogManager.addLog("[GitHub] $name updated successfully")
                         onProgress("$name updated successfully")
                     }
                 } catch (e: Exception) {
+                    LogManager.addLog("[GitHub] Error downloading $name: ${e.message}")
                     onProgress("Error downloading $name: ${e.message}")
                     allSuccess = false
                 }
             }
+            if (allSuccess) LogManager.addLog("[GitHub] Geo update finished successfully")
             allSuccess
         }
     }

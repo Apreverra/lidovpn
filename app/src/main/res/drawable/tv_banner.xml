@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+
+    <!-- Background Gradient (Vibrant Dark Red) -->
+    <path android:pathData="M0,0h320v180h-320z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="160"
+                android:centerY="90"
+                android:gradientRadius="240"
+                android:type="radial">
+                <item android:color="#8b0000" android:offset="0.0" />
+                <item android:color="#4a0000" android:offset="0.5" />
+                <item android:color="#000000" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Subtle texture / decorative lines -->
+    <path
+        android:pathData="M0,45 L320,45 M0,135 L320,135"
+        android:strokeWidth="0.5"
+        android:strokeColor="#26FFFFFF" />
+
+    <!-- Shield Glow (Brighter Red) -->
+    <path
+        android:pathData="M160,90m-65,0a65,65 0,1 1,130 0a65,65 0,1 1,-130 0"
+        android:fillAlpha="0.3">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="160"
+                android:centerY="90"
+                android:gradientRadius="65"
+                android:type="radial">
+                <item android:color="#FF1A1A" android:offset="0.0" />
+                <item android:color="#00000000" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Clean Minimalist Shield -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M160,45 L120,60 v25 c0,23 17,44 40,50 c23,-6 40,-27 40,-50 V60 L160,45 Z" />
+
+    <!-- Shield Inner Detail (Dark Core) -->
+    <path
+        android:fillColor="#2b0000"
+        android:pathData="M160,52 L128,64 v20 c0,18 13,35 32,40 c19,-5 32,-22 32,-40 V64 L160,52 Z" />
+
+</vector>

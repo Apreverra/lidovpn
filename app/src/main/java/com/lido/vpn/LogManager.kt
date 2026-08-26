@@ -1,32 +1,36 @@
 package com.lido.vpn
 
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.runtime.mutableStateListOf
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 object LogManager {
-    var vpnLogs by mutableStateOf(listOf<String>())
-        private set
+    // Use mutableStateListOf for efficient updates without copying the whole list
+    private val _vpnLogs = mutableStateListOf<String>()
+    val vpnLogs: List<String> get() = _vpnLogs
     
     private const val MAX_LOGS = 2000
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     fun addLog(message: String) {
         val timestamp = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         val formattedMessage = "[$timestamp] $message"
         
-        // Use a background-safe way to update state if needed, but for now simple list update
-        val currentLogs = vpnLogs.toMutableList()
-        currentLogs.add(formattedMessage)
-        if (currentLogs.size > MAX_LOGS) {
-            currentLogs.removeAt(0)
+        // Ensure state updates happen on the Main thread to avoid snapshot issues and ConcurrentModificationException
+        mainHandler.post {
+            _vpnLogs.add(formattedMessage)
+            if (_vpnLogs.size > MAX_LOGS) {
+                _vpnLogs.removeAt(0)
+            }
         }
-        vpnLogs = currentLogs
     }
 
     fun clearLogs() {
-        vpnLogs = emptyList()
+        mainHandler.post {
+            _vpnLogs.clear()
+        }
     }
 }

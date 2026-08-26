@@ -78,7 +78,7 @@ class VpnTileService : TileService() {
                             putExtra("MUX", prefs.getBoolean("mux", false))
                             putExtra("FRAGMENT", prefs.getBoolean("fragment", false))
                             putExtra("MTU", prefs.getInt("mtu", 1500))
-                            putExtra("ROUTING_MODE", prefs.getString("routing_mode", "BYPASS_LAN_RU"))
+                            putExtra("ROUTING_MODE", prefs.getString("routing_mode", "GLOBAL"))
                             
                             putExtra("APP_FILTER_ENABLED", prefs.getBoolean("app_filter_enabled", false))
                             putExtra("APP_FILTER_BYPASS", prefs.getBoolean("app_filter_bypass", false))
