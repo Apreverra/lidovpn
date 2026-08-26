@@ -626,7 +626,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
     var isSniffingEnabled by mutableStateOf(prefs.getBoolean("sniffing", false)) // Battery: default to OFF
     var isMuxEnabled by mutableStateOf(prefs.getBoolean("mux", false))
     var mtu by mutableIntStateOf(prefs.getInt("mtu", 1400)) // Battery: 1400 is safer for fragment reduction
-    var concurrentChecks by mutableIntStateOf(prefs.getInt("concurrent_checks", 30))
+    var concurrentChecks by mutableIntStateOf(prefs.getInt("concurrent_checks", 5))
     var byeDpiDns by mutableStateOf(prefs.getString("byedpi_dns", "8.8.8.8") ?: "8.8.8.8")
 
     fun updateByeDpiDns(value: String) {
@@ -1522,14 +1522,13 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
             mainTargetName = checkTargets.first().name
         }
 
-        // Check if service is already running
-        val manager = application.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-        @Suppress("DEPRECATION")
-        for (service in manager.getRunningServices(Integer.MAX_VALUE)) {
-            if (LidoVpnService::class.java.name == service.service.className) {
+        // State synchronization: Restore connected server after process death
+        val savedServerJson = prefs.getString("connected_server", null)
+        if (savedServerJson != null) {
+            try {
+                connectedServer = gson.fromJson(savedServerJson, VpnServer::class.java)
                 isConnected = true
-                break
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -2056,8 +2055,7 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                         .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
                         .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
                         .proxy(proxy)
-                        .sslSocketFactory(createUnsafeSslSocketFactory(), createUnsafeX509TrustManager())
-                        .hostnameVerifier { _, _ -> true }
+                        // Removed createUnsafeSslSocketFactory (VPN-002)
                         .build()
 
                     val request = Request.Builder()

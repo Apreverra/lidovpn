@@ -3,8 +3,11 @@ package com.lido.vpn
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -18,6 +21,48 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var coreController: CoreController? = null
     private val channelId = "lido_vpn_channel"
+    
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastStartIntent: Intent? = null
+
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        
+        networkCallback = object : ConnectivityManager.NetworkCallback() {
+            private var lastNetwork: Network? = null
+
+            override fun onAvailable(network: Network) {
+                if (lastNetwork != null && lastNetwork != network) {
+                    Log.d("LidoVpnService", "Network changed, triggering reconnect")
+                    sendLogToActivity("Network changed. Reconnecting...")
+                    lastStartIntent?.let { intent ->
+                        onStartCommand(intent, 0, 0)
+                    }
+                }
+                lastNetwork = network
+            }
+
+            override fun onLost(network: Network) {
+                sendLogToActivity("Connection lost.")
+            }
+        }
+        
+        try {
+            connectivityManager?.registerDefaultNetworkCallback(networkCallback!!)
+        } catch (e: Exception) {
+            Log.e("LidoVpnService", "Failed to register network callback", e)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        networkCallback?.let {
+            try {
+                connectivityManager?.unregisterNetworkCallback(it)
+            } catch (_: Exception) {}
+        }
+        networkCallback = null
+    }
 
     companion object {
         const val ACTION_START = "START"
@@ -58,14 +103,18 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == ACTION_START) {
+            lastStartIntent = intent
+            registerNetworkCallback()
+            
             val prefs = getSharedPreferences("vpn_settings", MODE_PRIVATE)
             val isRu = (prefs.getString("language", "EN") ?: "EN") == "RU"
-
+            
             val serverName = intent.getStringExtra("SERVER_NAME") ?: "VPN"
             val host = intent.getStringExtra("SERVER_HOST") ?: ""
             val port = intent.getIntExtra("SERVER_PORT", 443)
@@ -86,6 +135,10 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
                 type = type,
                 params = params,
             )
+            
+            // State Synchronization: Save connected server to prefs immediately
+            val gson = com.google.gson.Gson()
+            prefs.edit().putString("connected_server", gson.toJson(server)).apply()
             
             val dns = intent.getStringExtra("DNS") ?: "1.1.1.1"
             val sniffing = intent.getBooleanExtra("SNIFFING", true)
@@ -246,8 +299,13 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
             }
             
             if (!ipv6Enabled) {
-                // By NOT adding IPv6 addresses/routes, we effectively block IPv6 traffic 
-                // if the system doesn't have another path for it. 
+                // Prevent IPv6 leak by routing it to TUN and dropping it
+                try {
+                    builder.addAddress("fd00:1::2", 128)
+                    builder.addRoute("::", 0)
+                } catch (e: Exception) {
+                    Log.e("LidoVpnService", "Failed to add IPv6 leak protection route", e)
+                }
             } else {
                 builder.addAddress("fd00:1::2", 64)
                 builder.addRoute("::", 0)
@@ -417,6 +475,12 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
     private fun stopVpn() {
         sendLogToActivity("Disconnecting...")
         sendStateBroadcast(isConnected = false)
+        unregisterNetworkCallback()
+        lastStartIntent = null
+        
+        // Clear state sync
+        getSharedPreferences("vpn_settings", MODE_PRIVATE).edit().remove("connected_server").apply()
+        
         stopVpnCore()
         
         stopForeground(STOP_FOREGROUND_REMOVE)

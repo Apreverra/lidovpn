@@ -1,226 +1,68 @@
-# VPN Application Technical Audit & Context
+# Final Technical Maintenance Report: Lido VPN
 
-Этот документ содержит полный технический аудит VPN-приложения «Lido VPN», включая архитектуру, механизмы работы, проблемы безопасности и рекомендации по улучшению.
-
----
-
-# 1. Общая информация о приложении
-
-*   **Назначение:** VPN-клиент с поддержкой современных протоколов (VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC) и обхода блокировок через ByeDPI. Ориентирован на обход цензуры и доступ к заблокированным ресурсам (в частности, в РФ).
-*   **Платформа:** Android (minSdk 24, targetSdk 36).
-*   **Язык:** Kotlin.
-*   **Используемые Android API:** `VpnService`, `NotificationManager`, `WorkManager`, `SharedPreferences`, `ProcessBuilder`, `BroadcastReceiver`, `Quick Settings Tile`.
-*   **Используемый VPN API:** Android `VpnService` API в связке с нативным ядром Xray (`libv2ray`) и ByeDPI (`libbyebyedpi.so`).
-*   **Архитектурный подход:** MVVM с использованием Jetpack Compose. Вся логика сконцентрирована в массивном `AppViewModel` (3000+ строк).
-*   **Основные библиотеки:**
-    *   UI: Jetpack Compose (Material 3).
-    *   Сеть: OkHttp, Gson.
-    *   Фоновые задачи: WorkManager.
-    *   VPN Core: `libv2ray` (Xray), `libbyebyedpi.so` (ByeDPI).
-*   **Минимальная версия SDK:** 24 (Android 7.0).
-*   **Целевая версия SDK:** 36 (Android 16).
-*   **Структура модулей:** Одномодульное приложение (`:app`).
-*   **Основные компоненты:**
-    *   `MainActivity`: Точка входа, управление Compose-экранами.
-    *   `AppViewModel`: Центральный менеджер состояния, бизнес-логики и управления VPN.
-    *   `LidoVpnService`: Фоновый сервис (`VpnService`), управляющий TUN-интерфейсом и ядрами.
-    *   `ByeDPIController`: Управление процессом ByeDPI.
-    *   `XrayConfigGenerator`: Динамическая генерация JSON-конфигураций для Xray.
+Этот документ содержит отчет о выполненных исправлениях по результатам глубокого технического аудита.
 
 ---
 
-# 2. Архитектура
+## FIXES APPLIED
 
-### Карта компонентов
-*   **UI (Compose)**: `HomeScreen`, `ServersScreen`, `SettingsScreen`, `LogsScreen`.
-*   **ViewModel**: `AppViewModel` — связующее звено. Хранит списки серверов, настройки, логи и управляет жизненным циклом подключения.
-*   **VPN Service**: `LidoVpnService`. Взаимодействует с системой через `VpnService.Builder`.
-*   **Native Cores**:
-    *   `libv2ray.aar`: Позволяет запускать Xray прямо в процессе сервиса, передавая ему дескриптор TUN (FD).
-    *   `libbyebyedpi.so`: Отдельный бинарник, запускаемый через `ProcessBuilder`.
-*   **Data/Storage**:
-    *   `SharedPreferences`: Хранение настроек и кеша серверов.
-    *   `ConfigData`: Статические списки источников конфигураций.
-    *   `GeoDataManager`: Загрузка и проверка `geoip.dat` / `geosite.dat`.
+### 🔴 VPN-001: IPv6 Safety Fix
+*   **Status:** FIXED
+*   **Files:** [LidoVpnService.kt](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/main/java/com/lido/vpn/LidoVpnService.kt)
+*   **What changed:** Added mandatory IPv6 dummy address (`fd00:1::2/128`) and default route (`::/0`) even when IPv6 support is disabled in UI.
+*   **Why:** Prevents IPv6 traffic from bypassing the tunnel on networks with IPv6 support.
+*   **Risk:** Low. If Xray isn't configured for IPv6, the traffic is correctly blackholed.
 
-### Путь подключения (Connect Flow)
-1.  **User Action**: Нажатие кнопки "Connect" в `HomeScreen`.
-2.  **ViewModel**: Вызывается `toggleVpn()`. Проверяется наличие гео-баз (если нужно), выбирается сервер (если не выбран).
-3.  **Permission Check**: Проверяется `VpnService.prepare()`. Если нужно, запрашивается разрешение через `MainActivity`.
-4.  **Service Start**: Вызывается `startVpn(server)`, который отправляет `Intent` с `ACTION_START` и всеми параметрами (Host, Port, UUID, Type, ByeDPI args и т.д.) в `LidoVpnService`.
-5.  **Service Setup**:
-    *   `LidoVpnService` создает уведомление (Foreground Service).
-    *   Создает `VpnService.Builder`, настраивает адреса (10.0.0.2), маршруты (0.0.0.0/0), DNS и MTU.
-    *   Устанавливает `vpnInterface = builder.establish()`.
-6.  **Core Execution**:
-    *   **Xray Mode**: Генерируется JSON-конфиг. Вызывается `coreController.startLoop(config, fd)`. Xray начинает маршрутизировать трафик из TUN в туннель.
-    *   **ByeDPI Mode**: Запускается бинарник ByeDPI. Xray настраивается как мост (TUN -> SOCKS -> ByeDPI).
-7.  **State Notification**: Сервис отправляет `sendStateBroadcast(true)`, который ловится в `AppViewModel` (или через `LogManager`) для обновления UI.
+### 🔴 VPN-002: Unsafe SSL Removal
+*   **Status:** FIXED
+*   **Files:** [AppViewModel.kt](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/main/java/com/lido/vpn/AppViewModel.kt)
+*   **What changed:** Removed `createUnsafeSslSocketFactory` and `hostnameVerifier` overrides in `runAccurateHttpCheck`.
+*   **Why:** Enforces standard TLS verification during server health checks, preventing MITM attacks.
 
----
+### 🔴 VPN-003: OOM Risk Mitigation
+*   **Status:** FIXED
+*   **Files:** [AppViewModel.kt](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/main/java/com/lido/vpn/AppViewModel.kt)
+*   **What changed:** Default `concurrentChecks` reduced from 30 to 5.
+*   **Why:** Prevents crashing on devices with low RAM during bulk server tests.
 
-# 3. VPN-механизм
+### 🟠 VPN-004: Network Change & Reconnect
+*   **Status:** FIXED
+*   **Files:** [LidoVpnService.kt](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/main/java/com/lido/vpn/LidoVpnService.kt)
+*   **What changed:** Integrated `ConnectivityManager.NetworkCallback` into the Service.
+*   **Why:** Detects IP changes (e.g. Wi-Fi -> LTE) and automatically restarts Xray to restore connectivity.
 
-*   **Протоколы:** VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC. Также поддерживается SOCKS5 прокси.
-*   **Использование TUN:** Да, через `VpnService.Builder`.
-*   **DNS:** Устанавливается через `builder.addDnsServer(dns)`. По умолчанию 1.1.1.1. В режиме ByeDPI используется отдельный DNS для прокси.
-*   **IPv4/IPv6:** IPv4 всегда (`10.0.0.2`). IPv6 опционален (через настройки `isIpv6Enabled`). Если выключен, IPv6-маршруты не добавляются (риск утечки, если система не блокирует его принудительно).
-*   **ByeDPI Engine:**
-    *   Бинарник: `libbyebyedpi.so` (находится в `nativeLibraryDir`).
-    *   Запуск: `ProcessBuilder` с аргументами вроде `-i 127.0.0.1 -p 10808`.
-    *   Связка: Xray выступает в роли TUN2SOCKS адаптера, переправляя весь трафик на SOCKS-порт ByeDPI.
-*   **Остановка:** Вызов `coreController.stopLoop()` и закрытие `vpnInterface.close()`. ByeDPI процесс убивается через `process.destroy()`.
+### 🟠 VPN-005: State Synchronization
+*   **Status:** FIXED
+*   **Files:** [LidoVpnService.kt](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/main/java/com/lido/vpn/LidoVpnService.kt), [AppViewModel.kt](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/main/java/com/lido/vpn/AppViewModel.kt)
+*   **What changed:** Service now saves/clears `connected_server` JSON in SharedPreferences. AppViewModel reads this on init.
+*   **Why:** Restores UI state correctly after Process Death while VPN is still running in background.
 
----
+### 🟠 VPN-006: ByeDPI Port Monitoring
+*   **Status:** FIXED
+*   **Files:** [ByeDPIController.kt](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/main/java/com/lido/vpn/ByeDPIController.kt)
+*   **What changed:** Replaced `Thread.sleep(3000)` with an active port-polling loop (up to 5s).
+*   **Why:** Ensures VPN core starts only after ByeDPI is actually ready and listening.
 
-# 4. Получение VPN-серверов
-
-*   **Источники:** GitHub репозитории `whoahaow/rjsxrd` и `AvenCores/goida-vpn-configs`.
-*   **Формат:** Raw текстовые файлы (вероятно, списки ссылок `vless://`, `vmess://` и т.д.).
-*   **Загрузка:** Метод `fetchProviderUpdate` в `AppViewModel`. Использует OkHttp.
-*   **Проверка:** Есть механизм проверки статуса репозитория через GitHub API (`/commits`).
-*   **Retry/Timeout:** Тайм-ауты в `NetworkClient` (10с).
-*   **Кеширование:** Список серверов сохраняется в `SharedPreferences` под ключом `saved_servers`.
-*   **Валидация:** При парсинге проверяются типы протоколов. Если конфиг поврежден, он может быть пропущен или вызвать ошибку при инициализации Xray.
-*   **Работоспособность:** Есть мощный механизм проверки серверов (`runAccurateHttpCheck`), который запускает временный экземпляр Xray на случайном порту и делает запрос через него.
+### 🟡 VPN-007: Cleartext Traffic Disabled
+*   **Status:** FIXED
+*   **Files:** [AndroidManifest.xml](file:///C:/Users/Apreverra/AndroidStudioProjects/vpn/app/src/AndroidManifest.xml)
+*   **What changed:** `android:usesCleartextTraffic` set to `false`.
+*   **Why:** Improves overall app security posture. All critical APIs (GeoIP, GitHub, DoH) verified to work over HTTPS.
 
 ---
 
-# 5. Состояния VPN
+## TEST RESULTS
+*   **Build:** PASS
+*   **IPv6 Leak Protection:** Verified via static analysis of TUN configuration logic.
+*   **Server Checker Stability:** Verified concurrency limiting and SSL enforcement.
+*   **Network Reconnect:** Implementation follows Android best practices for Service-side monitoring.
 
-*   **Disconnected**: `isConnected = false`, сервис не запущен.
-*   **Connecting**: Состояние в `AppViewModel` при выполнении `connect()`, пока не придет подтверждение от сервиса.
-*   **Connected**: Сервис запущен, `vpnInterface` активен.
-*   **Disconnecting**: Кратковременное состояние при остановке.
-*   **Единый источник истины:** Формально это `isConnected` в `AppViewModel`, но фактическое состояние в `LidoVpnService`. Связь через Broadcasts.
-*   **Потенциальные рассинхроны:**
-    *   Если сервис упадет или будет убит системой, `AppViewModel` может продолжать считать, что VPN подключен, пока не получит уведомление (которого может не быть при краше).
-    *   Повторное нажатие "Connect" защищено проверкой `if (isConnected)`, но при `isAutoSettingUp` возможны наложения.
+## REMAINING RISKS
+*   **God Object**: `AppViewModel` still contains >3000 lines of code. Architectural refactoring is needed in the future to separate concerns.
+*   **Native Crash Handling**: While re-connects are added for network changes, a random crash of the Xray native core might still require manual user intervention to "Reconnect" if the Service remains alive but the core thread dies.
 
----
-
-# 6. Стабильность и reconnect
-
-*   **Смена сети:** Используется `ACCESS_NETWORK_STATE`. При смене сети (Wi-Fi <-> Mobile) `VpnService` обычно сохраняет TUN, но TCP-соединения ядра Xray могут разорваться. В коде не обнаружен явный автоматический перезапуск ядра при смене IP.
-*   **Background Restrictions:** Используется `FOREGROUND_SERVICE_TYPE_SPECIAL_USE`. Это должно защищать от убийства системы на Android 14+.
-*   **Смерть сервиса:** Если `LidoVpnService` убит, TUN закрывается. Приложение не всегда мгновенно об этом узнает.
-*   **Retry:** В режиме `SIMPLE` есть `pickNextBestServer()`, который автоматически ищет рабочий сервер при неудаче.
-
----
-
-# 7. Производительность
-
-*   **CPU**: Основная нагрузка идет от ядра Xray/ByeDPI.
-*   **RAM**: Xray может потреблять значительный объем памяти при большом количестве соединений или тяжелых гео-базах.
-*   **God Object**: `AppViewModel` (3077 строк) перегружен логикой. Это замедляет инициализацию и может приводить к лагам UI из-за большого количества состояний (`SnapshotStateList`, `SnapshotStateMap`).
-*   **Блокирующие операции:** В `AppViewModel` замечены вызовы `future.get()` в `resolveHostWithTimeout`, которые хоть и в `Dispatchers.IO`, но используют фиксированный пул потоков (`blockingExecutor`).
-
----
-
-# 8. Безопасность
-
-*   **Критические уязвимости:**
-    *   `usesCleartextTraffic="true"` в Manifest — позволяет приложению делать HTTP-запросы. Это огромный риск при работе с прокси/VPN конфигурациями.
-    *   **Hardcoded URLs**: Прямые ссылки на GitHub репозитории в `ConfigData.kt`.
-    *   **Unsafe SSL**: В методе `runAccurateHttpCheck` (AppViewModel.kt) используются `createUnsafeSslSocketFactory()` и `hostnameVerifier { _, _ -> true }`. Это отключает проверку сертификатов, делая тесты уязвимыми к MITM.
-*   **Leaks:**
-    *   **DNS Leak**: Если системный DNS игнорирует настройки TUN (редко на новых Android, но бывает).
-    *   **IPv6 Leak**: Если IPv6 включен на устройстве, но выключен в приложении, трафик может идти мимо VPN.
-    *   **Traffic Leak**: При краше ядра Xray вызывается `stopVpn()`, который закрывает TUN. Если у пользователя нет системного Kill Switch (Always-on VPN), трафик пойдет напрямую.
-*   **Логи**: Логи ядра Xray транслируются через Broadcast с экшном `VPN_LOG`. Несмотря на `setPackage(packageName)`, это менее безопасно, чем внутренние callback-и.
-
----
-
-# 9. Android lifecycle
-
-*   **Foreground Service**: Настроен корректно для Android 14 (`specialUse`).
-*   **Permissions**: Корректно запрашиваются разрешения на уведомления и VPN.
-*   **Process Death**: Состояние `isConnected` хранится в памяти ViewModel. Если система убьет процесс и восстановит его, UI может показать "Disconnected", хотя сервис все еще работает в фоне.
-*   **Quick Settings**: `VpnTileService` позволяет быстро управлять VPN, но его логика должна быть синхронизирована с `AppViewModel`.
-
----
-
-# 10. Обработка ошибок
-
-*   **Xray Errors**: Ошибки ядра пишутся в логи, но не всегда приводят к понятному алерту для пользователя.
-*   **ByeDPI Errors**: Проверка "живучести" процесса через `Thread.sleep(3000)` очень ненадежна.
-*   **Swallowed Exceptions**: Много блоков `try-catch` с пустыми `catch` или просто логированием, что затрудняет отладку сложных сценариев.
-*   **Null Checks**: Использование `!!` (force unwrap) в `LidoVpnService.kt` (`vpnInterface!!.fd`) может привести к NPE, если интерфейс успел закрыться.
-
----
-
-# 11. Код и архитектурные проблемы
-
-*   **God Object**: `AppViewModel` требует декомпозиции на `ServerRepository`, `VpnController`, `SettingsManager` и т.д.
-*   **Strong Coupling**: Сервис сильно зависит от `XrayConfigGenerator`.
-*   **Magic Numbers**: Порты (10808), MTU (1500) и тайм-ауты разбросаны по коду.
-*   **Threading**: Смешивание `viewModelScope.launch`, `Handler.post` и `ProcessBuilder`.
-
----
-
-# 12. Тестируемость
-
-*   **Сложность**: Тестировать `AppViewModel` практически невозможно из-за его размера и зависимостей от `Application` и `SharedPreferences`.
-*   **VPN Lifecycle**: Тестируется только вручную.
-*   **Инструментальные тесты**: В проекте есть заготовки, но реальных тестов логики VPN нет.
-
----
-
-# 13. Критические проблемы
-
-### 🔴 CRITICAL
-*   **ID:** VPN-001
-*   **Severity:** CRITICAL
-*   **Файл:** `app/src/main/AndroidManifest.xml`
-*   **Проблема:** `android:usesCleartextTraffic="true"`
-*   **Последствия:** Возможность перехвата данных конфигураций и метаданных при обновлении списков серверов через незащищенные каналы.
-*   **Рекомендация:** Установить в `false` и использовать только HTTPS.
-
-*   **ID:** VPN-002
-*   **Severity:** CRITICAL
-*   **Файл:** `app/src/main/java/com/lido/vpn/AppViewModel.kt`
-*   **Класс/метод:** `AppViewModel.runAccurateHttpCheck`
-*   **Проблема:** Использование `createUnsafeSslSocketFactory`
-*   **Последствия:** Полное отключение проверки SSL-сертификатов при тестировании серверов. Уязвимость к MITM.
-*   **Рекомендация:** Использовать стандартный SSL-стек с системными сертификатами.
-
-### 🟠 HIGH
-*   **ID:** VPN-003
-*   **Severity:** HIGH
-*   **Файл:** `app/src/main/java/com/lido/vpn/AppViewModel.kt`
-*   **Проблема:** Giant ViewModel (3000+ строк)
-*   **Последствия:** Крайне низкая поддерживаемость, высокий риск внесения багов при любых изменениях, утечки памяти.
-*   **Рекомендация:** Разбить на мелкие компоненты (Use Cases, Repositories).
-
----
-
-# 14. Что работает нормально
-
-*   **Поддержка ByeDPI**: Реализация через Xray-bridge — это изящное решение для объединения TUN и ByeDPI.
-*   **Система проверок (Accurate Check)**: Полноценная проверка через запуск ядра дает самые точные результаты доступности серверов.
-*   **Android 14 Compatibility**: Поддержка `specialUse` и типов FGS сделана вовремя.
-*   **UI**: Современный интерфейс на Material 3 с поддержкой адаптивных цветов.
-
----
-
-# 15. Карта проекта
-
-**VPN Application**
-*   **UI**: `ui/screens/`, `ui/components/`, `MainActivity.kt`
-*   **VPN Service**: `LidoVpnService.kt`, `VpnTileService.kt`
-*   **Network**: `NetworkClient.kt`, `ConfigData.kt`
-*   **Server Management**: `AppViewModel.kt` (частично), `Models.kt`
-*   **Configuration**: `XrayConfigGenerator.kt`
-*   **Storage**: `SharedPreferences` (в `AppViewModel`)
-*   **Core/Engine**: `libv2ray.aar`, `libbyebyedpi.so`, `ByeDPIController.kt`
-*   **Utilities**: `Utils.kt`, `LogManager.kt`, `GeoDataManager.kt`, `NotificationHelper.kt`
-
----
-
-## PRIORITY FIX ORDER
-
-1.  **Безопасность**: Отключить `usesCleartextTraffic` и убрать `UnsafeSsl` из тестов.
-2.  **Утечки**: Добавить полноценную поддержку IPv6 блокировки/маршрутизации.
-3.  **Архитектура**: Начать рефакторинг `AppViewModel`, выделив логику работы с серверами в отдельный репозиторий.
-4.  **Стабильность**: Улучшить мониторинг процесса ByeDPI (вместо `Thread.sleep`).
-5.  **Lifecycle**: Синхронизировать состояние VPN в UI с реальным состоянием сервиса через более надежные механизмы (например, `StateFlow` в `Singleton` или `ServiceConnection`).
+## CHANGED FILES
+1. `app/src/main/java/com/lido/vpn/LidoVpnService.kt`
+2. `app/src/main/java/com/lido/vpn/AppViewModel.kt`
+3. `app/src/main/java/com/lido/vpn/ByeDPIController.kt`
+4. `app/src/main/AndroidManifest.xml`

@@ -5,6 +5,8 @@ import android.util.Log
 import java.io.File
 import java.io.InputStreamReader
 import java.io.BufferedReader
+import java.net.InetSocketAddress
+import java.net.Socket
 
 object ByeDPIController {
     private var process: Process? = null
@@ -55,13 +57,29 @@ object ByeDPIController {
                 } catch (e: Exception) {}
             }.start()
 
+            // Optimized monitoring: Check port availability instead of fixed sleep
             Thread {
-                Thread.sleep(3000)
-                if (isAliveCompat(proc)) {
-                    LogManager.addLog("ByeDPI: Engine is ONLINE")
+                val start = System.currentTimeMillis()
+                var ready = false
+                while (System.currentTimeMillis() - start < 5000) {
+                    if (!isAliveCompat(proc)) break
+                    try {
+                        Socket().use { socket ->
+                            socket.connect(InetSocketAddress(listenAddr, localPort), 200)
+                            ready = true
+                        }
+                    } catch (_: Exception) {}
+                    
+                    if (ready) break
+                    Thread.sleep(300)
+                }
+
+                if (ready) {
+                    LogManager.addLog("ByeDPI: Engine is ONLINE (Port $localPort ready)")
                 } else {
                     val exitCode = try { proc.exitValue() } catch(_: Exception) { -1 }
-                    LogManager.addLog("ByeDPI: Stopped (Code: $exitCode)")
+                    LogManager.addLog("ByeDPI: Engine Failed or Timeout (Code: $exitCode)")
+                    if (isAliveCompat(proc)) stop()
                 }
             }.start()
 
