@@ -29,27 +29,39 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
     private fun registerNetworkCallback() {
         if (networkCallback != null) return
         
+        val cm = connectivityManager ?: return
+        
         networkCallback = object : ConnectivityManager.NetworkCallback() {
-            private var lastNetwork: Network? = null
+            private var lastPhysicalNetwork: Network? = null
 
             override fun onAvailable(network: Network) {
-                if (lastNetwork != null && lastNetwork != network) {
-                    Log.d("LidoVpnService", "Network changed, triggering reconnect")
+                // This callback is only for physical networks due to the request filter below
+                Log.d("LidoVpnService", "Network Available: $network (Last: $lastPhysicalNetwork)")
+                if (lastPhysicalNetwork != null && lastPhysicalNetwork != network) {
+                    Log.d("LidoVpnService", "Physical network changed from $lastPhysicalNetwork to $network, triggering reconnect")
                     sendLogToActivity("Network changed. Reconnecting...")
                     lastStartIntent?.let { intent ->
+                        // Re-run start command with same parameters
                         onStartCommand(intent, 0, 0)
                     }
                 }
-                lastNetwork = network
+                lastPhysicalNetwork = network
             }
 
             override fun onLost(network: Network) {
-                sendLogToActivity("Connection lost.")
+                if (network == lastPhysicalNetwork) {
+                    sendLogToActivity("Connection lost.")
+                    lastPhysicalNetwork = null
+                }
             }
         }
         
         try {
-            connectivityManager?.registerDefaultNetworkCallback(networkCallback!!)
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            cm.registerNetworkCallback(request, networkCallback!!)
         } catch (e: Exception) {
             Log.e("LidoVpnService", "Failed to register network callback", e)
         }
@@ -65,6 +77,7 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
     }
 
     companion object {
+        @Volatile var isServiceRunning = false
         const val ACTION_START = "START"
         const val ACTION_STOP = "STOP"
         const val ACTION_STATE = "com.lido.vpn.STATE"
@@ -109,6 +122,7 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == ACTION_START) {
+            isServiceRunning = true
             lastStartIntent = intent
             registerNetworkCallback()
             
@@ -474,6 +488,7 @@ class LidoVpnService : VpnService(), CoreCallbackHandler {
 
     private fun stopVpn() {
         sendLogToActivity("Disconnecting...")
+        isServiceRunning = false
         sendStateBroadcast(isConnected = false)
         unregisterNetworkCallback()
         lastStartIntent = null

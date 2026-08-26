@@ -812,8 +812,6 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                         .connectTimeout(5, TimeUnit.SECONDS)
                         .readTimeout(5, TimeUnit.SECONDS)
                         .proxy(proxy)
-                        .sslSocketFactory(createUnsafeSslSocketFactory(), createUnsafeX509TrustManager())
-                        .hostnameVerifier { _, _ -> true }
                         .build()
 
                     val semaphore = Semaphore(50)
@@ -973,9 +971,6 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(10, TimeUnit.SECONDS)
                 .followRedirects(true)
-                // Отключаем проверку SSL для теста доступности по IP
-                .sslSocketFactory(createUnsafeSslSocketFactory(), createUnsafeX509TrustManager())
-                .hostnameVerifier { _, _ -> true }
             
             if (proxy != null) {
                 clientBuilder.proxy(proxy)
@@ -1524,11 +1519,14 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
 
         // State synchronization: Restore connected server after process death
         val savedServerJson = prefs.getString("connected_server", null)
-        if (savedServerJson != null) {
+        if (savedServerJson != null && LidoVpnService.isServiceRunning) {
             try {
                 connectedServer = gson.fromJson(savedServerJson, VpnServer::class.java)
                 isConnected = true
             } catch (_: Exception) {}
+        } else if (savedServerJson != null) {
+            // Service is NOT running, but we have a stale pref. Clear it.
+            prefs.edit().remove("connected_server").apply()
         }
     }
 
@@ -2844,19 +2842,21 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
                                 var errorReason: String? = null
                                 
                                 try {
-                                    val timedOut = withTimeoutOrNull(10000L) {
-                                        val startTime = System.currentTimeMillis()
-                                        val delay = Libv2ray.measureOutboundDelay(vpnConfig, target.url)
-                                        val duration = System.currentTimeMillis() - startTime
+                                    coreSemaphore.withPermit {
+                                        val timedOut = withTimeoutOrNull(10000L) {
+                                            val startTime = System.currentTimeMillis()
+                                            val delay = Libv2ray.measureOutboundDelay(vpnConfig, target.url)
+                                            val duration = System.currentTimeMillis() - startTime
 
-                                        if (delay > 0) {
-                                            resultPing = duration
-                                        } else {
-                                            errorReason = "Failed"
-                                        }
-                                        true
-                                    } == null
-                                    if (timedOut) errorReason = "Timeout"
+                                            if (delay > 0) {
+                                                resultPing = duration
+                                            } else {
+                                                errorReason = "Failed"
+                                            }
+                                            true
+                                        } == null
+                                        if (timedOut) errorReason = "Timeout"
+                                    }
                                 } catch (e: Exception) {
                                     errorReason = e.message ?: "Error"
                                 }
@@ -3056,19 +3056,4 @@ class AppViewModel(application: android.app.Application) : AndroidViewModel(appl
         }
     }
 
-    private fun createUnsafeSslSocketFactory(): javax.net.ssl.SSLSocketFactory {
-        val trustAllCerts = arrayOf<javax.net.ssl.TrustManager>(createUnsafeX509TrustManager())
-        val sslContext = javax.net.ssl.SSLContext.getInstance("SSL")
-        sslContext.init(null, trustAllCerts, java.security.SecureRandom())
-        return sslContext.socketFactory
-    }
-
-    @Suppress("CustomX509TrustManager", "TrustAllX509TrustManager")
-    private fun createUnsafeX509TrustManager(): javax.net.ssl.X509TrustManager {
-        return object : javax.net.ssl.X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
-        }
-    }
 }

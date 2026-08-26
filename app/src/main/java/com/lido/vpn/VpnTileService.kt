@@ -1,6 +1,5 @@
 package com.lido.vpn
 
-import android.app.ActivityManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -133,14 +132,6 @@ class VpnTileService : TileService() {
     }
 
     private fun isServiceRunning(): Boolean {
-        val manager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        @Suppress("DEPRECATION")
-        val services = manager.getRunningServices(Integer.MAX_VALUE)
-        for (service in services) {
-            if (LidoVpnService::class.java.name == service.service.className) {
-                return true
-            }
-        }
-        return false
+        return LidoVpnService.isServiceRunning
     }
 }
